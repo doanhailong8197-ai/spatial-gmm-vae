@@ -1,0 +1,16 @@
+# Dữ liệu
+data/
+*.h5ad
+*.csv
+
+# Trọng số mô hình
+*.pth
+*.pt
+
+# Môi trường và cache Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+env/
+.env
