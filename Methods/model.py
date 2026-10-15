@@ -6,6 +6,8 @@ import itertools
 import numpy as np
 from sklearn.cluster import KMeans
 from scipy.optimize import linear_sum_assignment
+from scipy.stats import chi2 as chi2_dist
+from torch.utils.data import DataLoader
 
 
 class GradientReverseFunction(torch.autograd.Function):
@@ -249,20 +251,26 @@ class GMM_VAE(nn.Module):
         std = torch.exp(0.5 * log_var)
         return mu + torch.randn_like(std) * std
 
-    def get_gamma(self, z):
-        """
-        gamma[n, c] = P(c | z_n) = pi_c N(z_n | mu_c, var_c) / sum_k pi_k N(z_n | mu_k, var_k)
-        Tính trong log-space để ổn định số học. Trả về (B, K).
-        """
-        z = z.unsqueeze(1)                                   # (B, 1, D)
-        mu_c = self.mu_c.unsqueeze(0)                        # (1, K, D)
-        var_c = self.var_c.unsqueeze(0)                      # (1, K, D)
+    def get_gamma(self, z, pi=None, temperature=1.0):
+        z = z.unsqueeze(1)
+        mu_c = self.mu_c.unsqueeze(0)
+        var_c = self.var_c.unsqueeze(0)
 
         log_gauss = -0.5 * (
             math.log(2 * math.pi) + torch.log(var_c) + (z - mu_c).pow(2) / var_c
-        ).sum(dim=2)                                         # (B, K)
-        log_joint = torch.log(self.pi + 1e-10).unsqueeze(0) + log_gauss
-        return torch.softmax(log_joint, dim=1)
+        ).sum(dim=2)
+
+        if pi is None:
+            pi = self.pi
+        if pi.dim() == 1:
+            pi = pi.unsqueeze(0)
+
+        log_joint = torch.log(pi + 1e-10) + log_gauss
+        return torch.softmax(log_joint / temperature, dim=1)
+
+    def mahalanobis_sq(self, z):
+        diff = z.unsqueeze(1) - self.mu_c.unsqueeze(0)
+        return (diff.pow(2) / self.var_c.unsqueeze(0)).sum(dim=2)
 
     @torch.no_grad()
     def sample_augmented_latent(self, cluster_idx, num_samples, truncation=2.0):
@@ -503,3 +511,150 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
               f"domain: {stats['domain']:.4f} | z_aug/batch: {stats['n_aug']:.1f}")
 
     return history
+
+@torch.no_grad()
+def extract_mu(model, dataset, device, batch_size=512):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+    model.eval()
+    return torch.cat([model.encoder(x.to(device))[0] for x, _, _ in loader], dim=0)
+
+
+def build_spatial_neighbors(coords, k=15):
+    from sklearn.neighbors import NearestNeighbors
+    nn_ = NearestNeighbors(n_neighbors=k + 1).fit(coords)
+    _, idx = nn_.kneighbors(coords)
+    return torch.as_tensor(idx[:, 1:], dtype=torch.long)
+
+
+@torch.no_grad()
+def compute_prior(model, mu, mode="spatial", nbr=None, alpha=0.5, floor=1e-3):
+    K = model.n_clusters
+    if mode == "learned":
+        return model.pi.detach()
+
+    uniform = torch.full((K,), 1.0 / K, device=mu.device)
+    if mode == "uniform":
+        return uniform
+    if mode != "spatial" or nbr is None:
+        raise ValueError("mode='spatial' cần truyền nbr (láng giềng không gian)")
+
+    gamma0 = model.get_gamma(mu, pi=uniform)
+    neigh = gamma0[nbr].mean(dim=1)
+    prior = (1.0 - alpha) * uniform.unsqueeze(0) + alpha * neigh
+    prior = prior.clamp(min=floor)
+    return prior / prior.sum(dim=1, keepdim=True)
+
+
+@torch.no_grad()
+def dual_rejection(model, mu, prior, tau_H=0.5, chi2_conf=0.95):
+    gamma = model.get_gamma(mu, pi=prior)
+    H = -(gamma * torch.log(gamma + 1e-10)).sum(dim=1) / math.log(model.n_clusters)
+    cluster = gamma.argmax(dim=1)
+
+    d2 = model.mahalanobis_sq(mu).gather(1, cluster.unsqueeze(1)).squeeze(1)
+    d2_thr = float(chi2_dist.ppf(chi2_conf, df=model.latent_dim))
+
+    accept = (d2 < d2_thr) & (H < tau_H)
+    pseudo = torch.where(accept, cluster, torch.full_like(cluster, -1))
+    return {"pseudo_labels": pseudo, "cluster": cluster, "gamma": gamma,
+            "entropy": H, "d2": d2, "d2_thr": d2_thr, "accept": accept}
+
+
+def pseudo_kl_loss(mu, log_var, cluster_idx, model, detach_gmm=True):
+    mu_k = model.mu_c[cluster_idx]
+    var_k = model.var_c[cluster_idx]
+    if detach_gmm:
+        mu_k, var_k = mu_k.detach(), var_k.detach()
+    kl = 0.5 * (torch.log(var_k) - log_var + log_var.exp() / var_k
+                + (mu - mu_k).pow(2) / var_k - 1.0).sum(dim=1)
+    return kl.mean()
+
+
+def train_self_training(model, dataloader_rna, dataloader_spa, optimizer,
+                        rounds, epochs_per_round,
+                        lambda_1, lambda_2, lambda_3, lambda_grl, device,
+                        label_to_cluster=None, nbr=None,
+                        prior_mode="spatial", alpha=0.5,
+                        tau_H=0.5, chi2_conf=0.95, truncation=2.0,
+                        align_only_known=True):
+    model.to(device)
+    ds_spa = dataloader_spa.dataset
+    nbr = nbr.to(device) if nbr is not None else None
+    rna_iter = _infinite_loader(dataloader_rna)
+    history = []
+    res = None
+
+    for r in range(rounds):
+        mu_all = extract_mu(model, ds_spa, device)
+        prior = compute_prior(model, mu_all, prior_mode, nbr, alpha)
+        res = dual_rejection(model, mu_all, prior, tau_H, chi2_conf)
+        pseudo = res["pseudo_labels"]
+        acc_ratio = res["accept"].float().mean().item()
+        print(f"[Round {r + 1}/{rounds}] accepted: {acc_ratio:.1%} | "
+              f"unknown: {1 - acc_ratio:.1%} | chi2 thr: {res['d2_thr']:.1f}")
+
+        model.train()
+        for epoch in range(epochs_per_round):
+            sums = {"total": 0.0, "recon": 0.0, "gmm": 0.0, "domain": 0.0, "pseudo": 0.0}
+            n_steps = 0
+
+            for x_spa, _, idx in dataloader_spa:
+                x_rna, y_rna, _ = next(rna_iter)
+                x_rna, y_rna, x_spa = x_rna.to(device), y_rna.to(device), x_spa.to(device)
+                pl = pseudo[idx.to(device)]
+                known = pl >= 0
+                zero = x_spa.new_zeros(())
+
+                out_rna = model(x_rna, "src", lambda_val=lambda_grl)
+                mu_s, lv_s = model.encoder(x_spa)
+                z_s = model.reparameterize(mu_s, lv_s)
+                x_spa_hat = model.decoder_tgt(z_s)
+
+                loss_recon = reconstruction_loss(out_rna["x_hat"], x_rna) + \
+                             reconstruction_loss(x_spa_hat, x_spa)
+                loss_gmm = gmm_kl_loss(out_rna["mu"], out_rna["log_var"], out_rna["gamma"], model)
+
+                if known.any():
+                    loss_pseudo = pseudo_kl_loss(mu_s[known], lv_s[known], pl[known], model)
+                else:
+                    loss_pseudo = zero
+
+                z_spa_dom = z_s[known] if align_only_known else z_s
+                if z_spa_dom.size(0) > 0:
+                    z_aug = generate_latent_augmentation(model, y_rna, label_to_cluster, truncation)
+                    z_parts = [out_rna["z"], z_spa_dom]
+                    d_parts = [torch.ones(out_rna["z"].size(0), dtype=torch.long, device=device),
+                               torch.zeros(z_spa_dom.size(0), dtype=torch.long, device=device)]
+                    if z_aug is not None:
+                        z_parts.append(z_aug)
+                        d_parts.append(torch.ones(z_aug.size(0), dtype=torch.long, device=device))
+                    logits = model.domain_clf(torch.cat(z_parts, 0), lambda_=lambda_grl)
+                    loss_domain = domain_adversarial_loss(logits, torch.cat(d_parts, 0))
+                else:
+                    loss_domain = zero
+
+                loss_total = (loss_recon + lambda_1 * loss_gmm
+                              + lambda_2 * loss_domain + lambda_3 * loss_pseudo)
+
+                optimizer.zero_grad()
+                loss_total.backward()
+                optimizer.step()
+
+                sums["total"] += loss_total.item()
+                sums["recon"] += loss_recon.item()
+                sums["gmm"] += loss_gmm.item()
+                sums["domain"] += loss_domain.item()
+                sums["pseudo"] += loss_pseudo.item()
+                n_steps += 1
+
+            stats = {k: v / max(n_steps, 1) for k, v in sums.items()}
+            stats.update(round=r + 1, epoch=epoch + 1, accepted=acc_ratio)
+            history.append(stats)
+            print(f"  ep {epoch + 1}/{epochs_per_round} - total: {stats['total']:.3f} | "
+                  f"recon: {stats['recon']:.3f} | gmm: {stats['gmm']:.3f} | "
+                  f"domain: {stats['domain']:.3f} | pseudo: {stats['pseudo']:.3f}")
+
+    mu_all = extract_mu(model, ds_spa, device)
+    prior = compute_prior(model, mu_all, prior_mode, nbr, alpha)
+    res = dual_rejection(model, mu_all, prior, tau_H, chi2_conf)
+    return history, res
