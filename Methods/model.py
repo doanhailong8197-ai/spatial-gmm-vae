@@ -354,72 +354,38 @@ def solve_dustbin_unbalanced_ot(cost_matrix, ood_threshold, prior_pi=None,
     u_ood = T_ext[:, K]     # (B,)
     return T_known, u_ood
 
-
 def ot_open_set_alignment_loss(mu_spa, lv_spa, model, chi2_conf=0.95,
-                               reg_eps=0.1, tau_col=0.5, ood_margin_weight=0.5,
+                               reg_eps=0.1, tau_col=0.5,
                                detach_gmm_in_ot=True):
-    """
-    Tính toán đồng thời:
-      1. Kế hoạch vận chuyển Dustbin Unbalanced OT.
-      2. loss_ot_align: kéo các tế bào ST Known (w_j cao) về đúng cụm Gaussian nguồn.
-      3. loss_ood_margin: đẩy các tế bào ST Unknown (u_j cao) ra khỏi bán kính Chi-square của K cụm Known.
-    """
     d2_thr = float(chi2_dist.ppf(chi2_conf, df=model.latent_dim))
 
-    # Bước 1: Tính ma trận chi phí và giải kế hoạch vận chuyển T* (không truyền gradient qua solver)
     with torch.no_grad():
         cost_mat = model.expected_mahalanobis_sq(mu_spa, lv_spa, detach_gmm=True)
         T_known, u_ood = solve_dustbin_unbalanced_ot(
-            cost_mat,
-            ood_threshold=d2_thr,
-            prior_pi=model.pi,
-            reg_eps=reg_eps,
-            tau_col=tau_col,
+            cost_mat, ood_threshold=d2_thr, prior_pi=model.pi,
+            reg_eps=reg_eps, tau_col=tau_col,
         )
 
-    # Bước 2: Loss căn chỉnh và phân cụm cho các tế bào ST Known (weighted KL divergence)
     mu_c = model.mu_c.detach() if detach_gmm_in_ot else model.mu_c
     var_c = model.var_c.detach() if detach_gmm_in_ot else model.var_c
 
-    # Ma trận KL( q(z_j | x_spa) || N(mu_k, var_k) ): shape (B, K)
-    mu_exp = mu_spa.unsqueeze(1)        # (B, 1, D)
-    lv_exp = lv_spa.unsqueeze(1)        # (B, 1, D)
-    mu_c_exp = mu_c.unsqueeze(0)        # (1, K, D)
-    var_c_exp = var_c.unsqueeze(0)      # (1, K, D)
+    mu_exp, lv_exp = mu_spa.unsqueeze(1), lv_spa.unsqueeze(1)
+    mu_c_exp, var_c_exp = mu_c.unsqueeze(0), var_c.unsqueeze(0)
 
     pairwise_kl = 0.5 * (
-        torch.log(var_c_exp) - lv_exp
-        + lv_exp.exp() / var_c_exp
-        + (mu_exp - mu_c_exp).pow(2) / var_c_exp
-        - 1.0
-    ).sum(dim=2)  # (B, K)
+        torch.log(var_c_exp) - lv_exp + lv_exp.exp() / var_c_exp
+        + (mu_exp - mu_c_exp).pow(2) / var_c_exp - 1.0
+    ).sum(dim=2)
 
-    # Với tế bào Unknown (T_known ≈ 0), lực kéo này tự động triệt tiêu
     loss_ot_align = (T_known * pairwise_kl).sum(dim=1).mean()
 
-    # Bước 3: Loss đẩy biên cô lập cho các tế bào ST Unknown (Hinge Margin + ổn định phương sai)
-    d2_all = ((mu_exp - mu_c_exp).pow(2) / var_c_exp).sum(dim=2)  # (B, K)
-    min_d2, _ = d2_all.min(dim=1)                                 # Khoảng cách tới cụm Known gần nhất
-
-    # Đẩy mu_spa của tế bào Unknown ra ngoài mặt cầu Mahalanobis bán kính d2_thr
-    hinge_repulsion = F.relu(d2_thr - min_d2)
-    # Giữ phương sai của tế bào Unknown gần 1.0 để tránh suy biến khi không bị kéo vào cụm
-    var_reg_ood = 0.5 * (lv_spa.exp() - lv_spa - 1.0).sum(dim=1)
-
-    loss_ood = (u_ood * (hinge_repulsion + 0.1 * var_reg_ood)).mean()
-
-    total_ot_loss = loss_ot_align + ood_margin_weight * loss_ood
-    inlier_ratio = (1.0 - u_ood).mean().item()
-
     return {
-        "loss_ot_total": total_ot_loss,
+        "loss_ot_total": loss_ot_align,
         "loss_ot_align": loss_ot_align,
-        "loss_ood": loss_ood,
-        "inlier_ratio": inlier_ratio,
+        "inlier_ratio": (1.0 - u_ood).mean().item(),
         "T_known": T_known,
         "u_ood": u_ood,
     }
-
 
 # ==============================================================================
 # 3. QUY TRÌNH HUẤN LUYỆN 2 GIAI ĐOẠN (PRETRAIN & JOINT OT ALIGNMENT)
@@ -567,13 +533,13 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
                         lambda_1, lambda_2, device,
                         label_to_cluster=None, truncation=2.0,
                         chi2_conf=0.95, ot_reg_eps=0.1, ot_tau_col=0.5,
-                        ood_margin_weight=0.5, sup_weight=1.0):
+                        sup_weight=1.0):
     """
     Giai đoạn 2 (Huấn luyện chính):
       - Tái tạo biểu hiện gene cho cả hai miền (loss_recon).
       - Định hình cụm GMM và neo nhãn có giám sát trên miền nguồn + mẫu tăng cường z_aug (loss_gmm).
       - Căn chỉnh miền chọn lọc bằng Dustbin Unbalanced OT: kéo tế bào ST Known vào đúng cụm
-        và đẩy tế bào ST Unknown ra vùng ngoại vi (loss_ot).
+        (trọng số T_known); tế bào ST Unknown (T_known ≈ 0) không bị kéo (loss_ot).
     """
     model.to(device)
     model.train()
@@ -586,7 +552,7 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
     for epoch in range(epochs):
         sums = {
             "total": 0.0, "recon": 0.0, "gmm": 0.0,
-            "ot_align": 0.0, "ood": 0.0, "inlier_ratio": 0.0, "n_aug": 0
+            "ot_align": 0.0, "inlier_ratio": 0.0, "n_aug": 0
         }
         n_steps = 0
 
@@ -610,7 +576,7 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
                 out_rna["mu"], out_rna["log_var"], out_rna["gamma"], target_c, model
             )
 
-            # Tăng cường dữ liệu vùng ẩn cho các cụm thiểu số để giữ biên phân lớp cân bằng
+            # Tăng cường dữ liệu vùng ẩn cho các cụm thiểu số
             z_aug, c_aug = generate_latent_augmentation(model, y_rna, label_to_cluster, truncation)
             n_aug = 0
             if z_aug is not None:
@@ -620,7 +586,7 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
 
             loss_gmm_total = loss_gmm + sup_weight * loss_sup
 
-            # 3. Dustbin Unbalanced Optimal Transport (Căn chỉnh Known & Đẩy biên Unknown)
+            # 3. Dustbin Unbalanced Optimal Transport (chỉ căn chỉnh tế bào ST Known)
             ot_out = ot_open_set_alignment_loss(
                 out_spa["mu"],
                 out_spa["log_var"],
@@ -628,7 +594,6 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
                 chi2_conf=chi2_conf,
                 reg_eps=ot_reg_eps,
                 tau_col=ot_tau_col,
-                ood_margin_weight=ood_margin_weight,
                 detach_gmm_in_ot=True,
             )
             loss_ot_total = ot_out["loss_ot_total"]
@@ -644,7 +609,6 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
             sums["recon"] += loss_recon.item()
             sums["gmm"] += loss_gmm_total.item()
             sums["ot_align"] += ot_out["loss_ot_align"].item()
-            sums["ood"] += ot_out["loss_ood"].item()
             sums["inlier_ratio"] += ot_out["inlier_ratio"]
             sums["n_aug"] += n_aug
             n_steps += 1
@@ -655,12 +619,11 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
         print(
             f"[Joint-OT] Epoch {epoch + 1}/{epochs} - total: {stats['total']:.4f} | "
             f"recon: {stats['recon']:.4f} | gmm: {stats['gmm']:.4f} | "
-            f"ot_align: {stats['ot_align']:.4f} | ood: {stats['ood']:.4f} | "
+            f"ot_align: {stats['ot_align']:.4f} | "
             f"known_spa: {stats['inlier_ratio']:.1%} | z_aug: {stats['n_aug']:.1f}"
         )
 
     return history
-
 
 # ==============================================================================
 # 4. SUY LUẬN HẬU HUẤN LUYỆN & PHÂN LOẠI CÓ LỌC OOD (INFERENCE)
