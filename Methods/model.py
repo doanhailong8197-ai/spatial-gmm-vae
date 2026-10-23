@@ -279,46 +279,27 @@ def supervised_gmm_kl_loss(mu, log_var, cluster_idx, model, detach_gmm=False):
 
 @torch.no_grad()
 def sinkhorn_log_domain(cost_matrix, reg=0.1, tau_s=None, tau_t=None, num_iters=50, eps=1e-8):
-    """
-    Giải kế hoạch vận chuyển tối ưu (Optimal Transport Plan) trong miền log.
-    Hỗ trợ cả Balanced OT (khi tau_s=None, tau_t=None) và Unbalanced OT (khi truyền tau_s, tau_t > 0).
-
-    Args:
-        cost_matrix: Ma trận chi phí (N_s, N_t).
-        reg:         Hệ số điều chuẩn entropy (epsilon).
-        tau_s:       Hệ số nới lỏng KL biên nguồn (None = ràng buộc cứng Balanced).
-        tau_t:       Hệ số nới lỏng KL biên đích (None = ràng buộc cứng Balanced).
-        num_iters:   Số vòng lặp Sinkhorn.
-    Returns:
-        P: Kế hoạch vận chuyển (N_s, N_t), đã detach.
-    """
     n_s, n_t = cost_matrix.shape
-    device = cost_matrix.device
-    dtype = cost_matrix.dtype
+    dev, dt = cost_matrix.device, cost_matrix.dtype
 
-    # Chuẩn hóa chi phí theo median của batch hiện tại để bất biến với quy mô Domain Shift
-    scale = torch.median(cost_matrix).clamp(min=eps)
-    C_norm = cost_matrix / scale
+    cost_matrix = torch.nan_to_num(cost_matrix, nan=0.0, posinf=1e6)
+    C = cost_matrix / torch.median(cost_matrix).clamp(min=eps)
 
-    log_a = torch.full((n_s,), -math.log(n_s), device=device, dtype=dtype)
-    log_b = torch.full((n_t,), -math.log(n_t), device=device, dtype=dtype)
+    log_a = torch.full((n_s,), -math.log(n_s), device=dev, dtype=dt)
+    log_b = torch.full((n_t,), -math.log(n_t), device=dev, dtype=dt)
+    f = torch.zeros(n_s, device=dev, dtype=dt)
+    g = torch.zeros(n_t, device=dev, dtype=dt)
 
-    f = torch.zeros(n_s, device=device, dtype=dtype)
-    g = torch.zeros(n_t, device=device, dtype=dtype)
-
-    rho_s = 1.0 if tau_s is None else (tau_s / (tau_s + reg))
-    rho_t = 1.0 if tau_t is None else (tau_t / (tau_t + reg))
+    rho_s = 1.0 if tau_s is None else tau_s / (tau_s + reg)
+    rho_t = 1.0 if tau_t is None else tau_t / (tau_t + reg)
 
     for _ in range(num_iters):
-        # Cập nhật tiềm năng đối ngẫu nguồn f và đích g trong miền log
-        f = rho_s * (log_a - torch.logsumexp((g.unsqueeze(0) - C_norm) / reg, dim=1))
-        g = rho_t * (log_b - torch.logsumexp((f.unsqueeze(1) - C_norm) / reg, dim=0))
+        f = -rho_s * reg * torch.logsumexp(log_b.unsqueeze(0) + (g.unsqueeze(0) - C) / reg, dim=1)
+        g = -rho_t * reg * torch.logsumexp(log_a.unsqueeze(1) + (f.unsqueeze(1) - C) / reg, dim=0)
 
-    log_P = (f.unsqueeze(1) + g.unsqueeze(0) - C_norm) / reg
+    log_P = log_a.unsqueeze(1) + log_b.unsqueeze(0) + (f.unsqueeze(1) + g.unsqueeze(0) - C) / reg
     P = torch.exp(log_P)
-    # Chuẩn hóa tổng khối lượng kế hoạch vận chuyển về 1 để giữ thang đo gradient ổn định
-    P = P / P.sum().clamp(min=eps)
-    return P
+    return P / P.sum().clamp(min=eps)
 
 
 def ot_alignment_loss(z_src, z_tgt, model=None, ot_mode="hybrid",
