@@ -277,83 +277,73 @@ def supervised_gmm_kl_loss(mu, log_var, cluster_idx, model, detach_gmm=False):
     return kl.mean()
 
 
-@torch.no_grad()
-def sinkhorn_log_domain(cost_matrix, reg=0.1, tau_s=None, tau_t=None, num_iters=50, eps=1e-8):
-    n_s, n_t = cost_matrix.shape
-    dev, dt = cost_matrix.device, cost_matrix.dtype
-
-    cost_matrix = torch.nan_to_num(cost_matrix, nan=0.0, posinf=1e6)
-    C = cost_matrix / torch.median(cost_matrix).clamp(min=eps)
-
-    log_a = torch.full((n_s,), -math.log(n_s), device=dev, dtype=dt)
-    log_b = torch.full((n_t,), -math.log(n_t), device=dev, dtype=dt)
-    f = torch.zeros(n_s, device=dev, dtype=dt)
-    g = torch.zeros(n_t, device=dev, dtype=dt)
-
-    rho_s = 1.0 if tau_s is None else tau_s / (tau_s + reg)
-    rho_t = 1.0 if tau_t is None else tau_t / (tau_t + reg)
-
-    for _ in range(num_iters):
-        f = -rho_s * reg * torch.logsumexp(log_b.unsqueeze(0) + (g.unsqueeze(0) - C) / reg, dim=1)
-        g = -rho_t * reg * torch.logsumexp(log_a.unsqueeze(1) + (f.unsqueeze(1) - C) / reg, dim=0)
-
-    log_P = log_a.unsqueeze(1) + log_b.unsqueeze(0) + (f.unsqueeze(1) + g.unsqueeze(0) - C) / reg
-    P = torch.exp(log_P)
-    return P / P.sum().clamp(min=eps)
-
-
-def ot_alignment_loss(z_src, z_tgt, model=None, ot_mode="hybrid",
-                      reg=0.1, tau_s=1.0, tau_t=1.0, num_iters=50):
+def gmm_contrastive_alignment_loss(z_src, z_tgt, model, temperature=0.1,
+                                   radial_weight=0.5, eps=1e-8):
     """
-    Hàm mất mát căn chỉnh miền bằng Optimal Transport (không phân chia cứng Known/Unknown).
+    Energy-Gated Contrastive GMM Alignment + Radial Moment Matching.
 
-    Args:
-        z_src:   Biểu diễn miền nguồn (đã gộp z_aug nếu có), shape (N_s, D).
-        z_tgt:   Biểu diễn miền đích (ST), shape (N_t, D).
-        model:   Thực thể GMM_VAE (cần khi ot_mode là 'prototype' hoặc 'hybrid').
-        ot_mode:
-            - 'sample':    OT giữa các mẫu nguồn z_src và mẫu đích z_tgt.
-            - 'prototype': OT giữa K cụm GMM (mu_c, var_c) và mẫu đích z_tgt.
-            - 'hybrid':    Kết hợp cả Sample-level OT và Prototype-level OT.
-        reg:     Hệ số entropy Sinkhorn (mặc định 0.1).
-        tau_s, tau_t: Hệ số nới lỏng biên của Unbalanced OT (truyền None nếu muốn Balanced OT).
+    - loss_radial: khớp mean / std toàn cục của z_tgt với z_src (z_src bị detach),
+      chống sụp đổ bán kính của đám mây ST vào vùng trung tâm.
+    - loss_contrastive: kéo z_tgt về cụm GMM chiến thắng (target DEC sắc nét, cân bằng
+      tần suất cụm), có trọng số mềm w_i theo Free Energy (median/MAD) để không ép các
+      tế bào Unknown/OOD (năng lượng cao) vào cụm nguồn. Không cắt ngưỡng cứng.
     """
-    loss = z_tgt.new_zeros(())
+    # ---- Thành phần 1: Radial / Global Moment Matching ----
+    z_src_d = z_src.detach()
+    mean_src, mean_tgt = z_src_d.mean(dim=0), z_tgt.mean(dim=0)
+    std_src = (z_src_d.var(dim=0, unbiased=False) + eps).sqrt()
+    std_tgt = (z_tgt.var(dim=0, unbiased=False) + eps).sqrt()
+    loss_radial = F.mse_loss(mean_tgt, mean_src) + F.mse_loss(std_tgt, std_src)
 
-    if ot_mode in ("sample", "hybrid"):
-        # Chi phí khoảng cách bình phương trung bình theo chiều ẩn giữa mẫu nguồn và mẫu đích
-        cost_sample = torch.cdist(z_src, z_tgt, p=2).pow(2) / z_tgt.size(1)
-        P_sample = sinkhorn_log_domain(
-            cost_sample.detach(), reg=reg, tau_s=tau_s, tau_t=tau_t, num_iters=num_iters
-        )
-        loss = loss + (P_sample * cost_sample).sum()
+    # ---- Thành phần 2: Energy-Gated Mode-Seeking Contrastive GMM Loss ----
+    mu_c = model.mu_c.detach()        # (K, D)
+    var_c = model.var_c.detach()      # (K, D)
 
-    if ot_mode in ("prototype", "hybrid"):
-        if model is None:
-            raise ValueError("Cần truyền `model` khi sử dụng ot_mode='prototype' hoặc 'hybrid'.")
-        # Chi phí Mahalanobis chuẩn hóa từ K tâm cụm nguồn (detach tâm cụm để ST di chuyển về nguồn)
-        diff = z_tgt.unsqueeze(1) - model.mu_c.detach().unsqueeze(0)       # (N_t, K, D)
-        var_c = model.var_c.detach().unsqueeze(0)                          # (1, K, D)
-        cost_proto = (diff.pow(2) / var_c).mean(dim=2).T                   # (K, N_t)
-        P_proto = sinkhorn_log_domain(
-            cost_proto.detach(), reg=reg, tau_s=tau_s, tau_t=tau_t, num_iters=num_iters
-        )
-        loss = loss + (P_proto * cost_proto).sum()
+    diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)            # (N_t, K, D)
+    d = (diff.pow(2) / var_c.unsqueeze(0)).mean(dim=2)       # (N_t, K)
 
-    if ot_mode == "hybrid":
-        loss = 0.5 * loss
+    logits = -0.5 * d / temperature
+    log_p = torch.log_softmax(logits, dim=1)                 # prior đồng đều
+    p = log_p.exp()
 
-    return loss
+    with torch.no_grad():
+        p_ng = p.detach()
+        # Sharpened DEC target, cân bằng tần suất cụm
+        f_k = p_ng.sum(dim=0) + eps                          # (K,)
+        q = p_ng.pow(2) / f_k.unsqueeze(0)
+        q = q / q.sum(dim=1, keepdim=True).clamp(min=eps)
+
+        # Free Energy Helmholtz -> cổng trọng số mềm
+        E = -temperature * torch.logsumexp(logits, dim=1)    # (N_t,)
+        med_E = E.median()
+        mad_E = (E - med_E).abs().median() * 1.4826 + eps
+        w = torch.sigmoid(-(E - med_E) / mad_E)              # (N_t,)
+
+    ell = -(q * torch.log(p + eps)).sum(dim=1)               # (N_t,)
+    loss_contrastive = (w * ell).sum() / (w.sum() + eps)
+
+    return loss_contrastive + radial_weight * loss_radial
 
 
 # =====================================================================
 # 3. GIAI ĐOẠN 1: PRETRAIN VAE & KHỞI TẠO THAM SỐ GMM
 # =====================================================================
 
-def pretrain_vae(model, dataloader_rna, optimizer, epochs, device):
+def _infinite_loader(loader):
+    while True:
+        for batch in loader:
+            yield batch
+
+
+def pretrain_vae(model, dataloader_rna, optimizer, epochs, device, dataloader_spa=None):
+    """
+    Giai đoạn 1: pretrain VAE. Nếu truyền dataloader_spa, mỗi bước còn cộng thêm
+    reconstruction loss của ST qua encoder dùng chung + decoder_tgt.
+    """
     model.to(device)
     model.train()
     history = []
+    spa_iter = _infinite_loader(dataloader_spa) if dataloader_spa is not None else None
 
     for epoch in range(epochs):
         total_loss, n_batches = 0.0, 0
@@ -363,8 +353,15 @@ def pretrain_vae(model, dataloader_rna, optimizer, epochs, device):
             mu, log_var = model.encoder(x)
             z = model.reparameterize(mu, log_var)
             x_hat = model.decoder_src(z)
-
             loss = reconstruction_loss(x_hat, x)
+
+            if spa_iter is not None:
+                x_spa, _, _ = next(spa_iter)
+                x_spa = x_spa.to(device)
+                mu_s, log_var_s = model.encoder(x_spa)
+                z_s = model.reparameterize(mu_s, log_var_s)
+                x_hat_s = model.decoder_tgt(z_s)
+                loss = loss + reconstruction_loss(x_hat_s, x_spa)
 
             optimizer.zero_grad()
             loss.backward()
@@ -479,19 +476,22 @@ def generate_latent_augmentation(model, labels, label_to_cluster=None, truncatio
 def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs,
                         lambda_1, lambda_2, device,
                         label_to_cluster=None, truncation=2.0,
-                        gmm_on_target=False, ot_mode="hybrid",
-                        ot_reg=0.1, ot_tau_s=1.0, ot_tau_t=1.0, ot_iters=50):
+                        gmm_on_target=False,
+                        align_temp=0.1, radial_weight=0.5,
+                        # --- tham số cũ giữ lại để tương thích ngược với Notebook ---
+                        ot_mode=None, ot_reg=None, ot_tau_s=None, ot_tau_t=None,
+                        ot_iters=None, **kwargs):
     """
-    Huấn luyện chung GMM-VAE kết hợp căn chỉnh miền bằng Optimal Transport (Giai đoạn 2).
-    Không thực hiện phân chia cứng Known/Unknown trong quá trình tối ưu.
+    Huấn luyện chung GMM-VAE (Giai đoạn 2) với Energy-Gated Contrastive GMM Alignment
+    + Radial Moment Matching thay cho Optimal Transport.
 
     Args:
-        lambda_1: Trọng số của GMM KL loss.
-        lambda_2: Trọng số của Optimal Transport loss.
-        label_to_cluster: Ánh xạ từ nhãn scRNA-seq sang chỉ số cụm GMM để neo cố định tâm cụm.
-        ot_mode:  'hybrid' (mặc định), 'sample', hoặc 'prototype'.
-        ot_reg:   Hệ số điều chuẩn entropy Sinkhorn (epsilon).
-        ot_tau_s, ot_tau_t: Hệ số nới lỏng biên Unbalanced OT (đặt None nếu dùng Balanced OT).
+        lambda_1: Trọng số GMM KL loss.
+        lambda_2: Trọng số alignment loss (contrastive + radial).
+        label_to_cluster: Ánh xạ nhãn scRNA-seq -> cụm GMM để neo tâm cụm.
+        align_temp: Nhiệt độ Boltzmann của alignment loss.
+        radial_weight: Trọng số thành phần Radial Moment Matching.
+        ot_*, **kwargs: được chấp nhận nhưng bỏ qua (tương thích ngược).
     """
     model.to(device)
     model.train()
@@ -512,7 +512,7 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
             out_rna = model(x_rna, "src")
             out_spa = model(x_spa, "tgt")
 
-            # 1. Reconstruction Loss trên cả hai miền (bảo toàn thông tin biểu hiện gene)
+            # 1. Reconstruction Loss trên cả hai miền
             loss_recon = (
                 reconstruction_loss(out_rna["x_hat"], x_rna)
                 + reconstruction_loss(out_spa["x_hat"], x_spa)
@@ -546,19 +546,16 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
             else:
                 z_src_all = out_rna["mu"]
 
-            # 4. Optimal Transport Alignment Loss (liên tục, không cắt ngưỡng Known/Unknown)
-            loss_ot = ot_alignment_loss(
+            # 4. Energy-Gated Contrastive GMM Alignment + Radial Moment Matching
+            loss_align = gmm_contrastive_alignment_loss(
                 z_src=z_src_all,
                 z_tgt=out_spa["mu"],
                 model=model,
-                ot_mode=ot_mode,
-                reg=ot_reg,
-                tau_s=ot_tau_s,
-                tau_t=ot_tau_t,
-                num_iters=ot_iters,
+                temperature=align_temp,
+                radial_weight=radial_weight,
             )
 
-            loss_total = loss_recon + lambda_1 * loss_gmm + lambda_2 * loss_ot
+            loss_total = loss_recon + lambda_1 * loss_gmm + lambda_2 * loss_align
 
             optimizer.zero_grad()
             loss_total.backward()
@@ -567,7 +564,7 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
             sums["total"] += loss_total.item()
             sums["recon"] += loss_recon.item()
             sums["gmm"] += loss_gmm.item()
-            sums["ot"] += loss_ot.item()
+            sums["ot"] += loss_align.item()   # giữ key "ot" để Notebook đọc history không lỗi
             sums["n_aug"] += n_aug
             n_steps += 1
 
@@ -575,13 +572,12 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
         stats = {k: v / n_steps for k, v in sums.items()}
         history.append(stats)
         print(
-            f"[Joint-OT] Epoch {epoch + 1}/{epochs} - total: {stats['total']:.4f} | "
+            f"[Joint-Align] Epoch {epoch + 1}/{epochs} - total: {stats['total']:.4f} | "
             f"recon: {stats['recon']:.4f} | gmm: {stats['gmm']:.4f} | "
-            f"ot: {stats['ot']:.4f} | z_aug/batch: {stats['n_aug']:.1f}"
+            f"align: {stats['ot']:.4f} | z_aug/batch: {stats['n_aug']:.1f}"
         )
 
     return history
-
 
 # =====================================================================
 # 5. SUY LUẬN & PHÁT HIỆN OOD SAU HUẤN LUYỆN (POST-TRAINING INFERENCE)
