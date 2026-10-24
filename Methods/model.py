@@ -278,52 +278,67 @@ def supervised_gmm_kl_loss(mu, log_var, cluster_idx, model, detach_gmm=False):
 
 
 def gmm_contrastive_alignment_loss(z_src, z_tgt, model, temperature=0.1,
-                                   radial_weight=0.5, eps=1e-8):
+                                   radial_weight=1.0, eps=1e-8):
     """
-    Energy-Gated Contrastive GMM Alignment + Radial Moment Matching.
-
-    - loss_radial: khớp mean / std toàn cục của z_tgt với z_src (z_src bị detach),
-      chống sụp đổ bán kính của đám mây ST vào vùng trung tâm.
-    - loss_contrastive: kéo z_tgt về cụm GMM chiến thắng (target DEC sắc nét, cân bằng
-      tần suất cụm), có trọng số mềm w_i theo Free Energy (median/MAD) để không ép các
-      tế bào Unknown/OOD (năng lượng cao) vào cụm nguồn. Không cắt ngưỡng cứng.
+    Hybrid Mode-Seeking GMM Alignment:
+    1. Deep CORAL (Mean + Full Covariance Alignment): Xoay và khớp toàn bộ hình học toàn cục
+       của đám mây ST trùng lên đám mây scRNA-seq (chống lệch trục song song trên UMAP/t-SNE).
+    2. Direct Mahalanobis Pull + Sharpened Contrastive Loss:
+       - Contrastive đẩy điểm ST ra khỏi vùng tranh chấp giữa các cụm.
+       - Direct Mahalanobis Pull kéo thẳng điểm ST đi vào tâm cụm mu_c (không bị bão hòa
+         sớm ở rìa cụm như Softmax thuần túy).
+    3. Free-Energy Soft Gate (w_i): Bảo vệ tế bào Unknown (OOD) một cách liên tục.
     """
-    # ---- Thành phần 1: Radial / Global Moment Matching ----
+    D = z_tgt.size(1)
     z_src_d = z_src.detach()
-    mean_src, mean_tgt = z_src_d.mean(dim=0), z_tgt.mean(dim=0)
-    std_src = (z_src_d.var(dim=0, unbiased=False) + eps).sqrt()
-    std_tgt = (z_tgt.var(dim=0, unbiased=False) + eps).sqrt()
-    loss_radial = F.mse_loss(mean_tgt, mean_src) + F.mse_loss(std_tgt, std_src)
 
-    # ---- Thành phần 2: Energy-Gated Mode-Seeking Contrastive GMM Loss ----
+    # ---- 1. Deep CORAL: Khớp Mean + Full Covariance Matrix (D x D) ----
+    mean_src = z_src_d.mean(dim=0, keepdim=True)
+    mean_tgt = z_tgt.mean(dim=0, keepdim=True)
+    loss_mean = F.mse_loss(mean_tgt, mean_src, reduction="sum")
+
+    zc_src = z_src_d - mean_src
+    zc_tgt = z_tgt - mean_tgt
+    cov_src = (zc_src.T @ zc_src) / max(z_src_d.size(0) - 1, 1)
+    cov_tgt = (zc_tgt.T @ zc_tgt) / max(z_tgt.size(0) - 1, 1)
+    loss_cov = F.mse_loss(cov_tgt, cov_src, reduction="sum") / D
+    loss_coral = loss_mean + loss_cov
+
+    # ---- 2. Khoảng cách Mahalanobis tới K tâm cụm GMM nguồn ----
     mu_c = model.mu_c.detach()        # (K, D)
     var_c = model.var_c.detach()      # (K, D)
 
     diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)            # (N_t, K, D)
-    d = (diff.pow(2) / var_c.unsqueeze(0)).mean(dim=2)       # (N_t, K)
+    maha_full = (diff.pow(2) / var_c.unsqueeze(0)).sum(dim=2) # (N_t, K) - cùng thang đo với KL
+    maha_mean = maha_full / D                                 # (N_t, K) - chuẩn hóa theo chiều D
 
-    logits = -0.5 * d / temperature
-    log_p = torch.log_softmax(logits, dim=1)                 # prior đồng đều
+    logits = -0.5 * maha_mean / temperature
+    log_p = torch.log_softmax(logits, dim=1)
     p = log_p.exp()
 
     with torch.no_grad():
         p_ng = p.detach()
-        # Sharpened DEC target, cân bằng tần suất cụm
-        f_k = p_ng.sum(dim=0) + eps                          # (K,)
-        q = p_ng.pow(2) / f_k.unsqueeze(0)
+        # Phân phối mục tiêu DEC sắc nét, cân bằng tần suất cụm
+        f_k = p_ng.sum(dim=0).clamp(min=eps)
+        q = (p_ng.pow(2) / f_k.unsqueeze(0))
         q = q / q.sum(dim=1, keepdim=True).clamp(min=eps)
 
-        # Free Energy Helmholtz -> cổng trọng số mềm
-        E = -temperature * torch.logsumexp(logits, dim=1)    # (N_t,)
-        med_E = E.median()
-        mad_E = (E - med_E).abs().median() * 1.4826 + eps
-        w = torch.sigmoid(-(E - med_E) / mad_E)              # (N_t,)
+        # Cổng trọng số mềm theo khoảng cách Mahalanobis nhỏ nhất (Free Energy)
+        min_d = maha_mean.min(dim=1).values
+        med_d = min_d.median()
+        mad_d = (min_d - med_d).abs().median() * 1.4826 + eps
+        # Điểm Known (min_d <= med_d + mad_d) có w ≈ 1; điểm OOD xa có w giảm mượt về nhỏ
+        w = torch.sigmoid(-(min_d - (med_d + 0.5 * mad_d)) / (mad_d + eps))
 
-    ell = -(q * torch.log(p + eps)).sum(dim=1)               # (N_t,)
-    loss_contrastive = (w * ell).sum() / (w.sum() + eps)
+    # Lực 1: Contrastive Cross-Entropy (phân tách ranh giới giữa các cụm)
+    loss_ce = -(q * log_p).sum(dim=1)                        # (N_t,)
 
-    return loss_contrastive + radial_weight * loss_radial
+    # Lực 2: Direct Mahalanobis Pull (kéo điểm ST đi hẳn vào tâm cụm mu_c, không dừng ở rìa)
+    loss_pull = 0.5 * (q * maha_full).sum(dim=1)             # (N_t,)
 
+    loss_cluster = (w * (loss_pull + 2.0 * loss_ce)).sum() / (w.sum() + eps)
+
+    return loss_cluster + radial_weight * loss_coral
 
 # =====================================================================
 # 3. GIAI ĐOẠN 1: PRETRAIN VAE & KHỞI TẠO THAM SỐ GMM
@@ -336,10 +351,6 @@ def _infinite_loader(loader):
 
 
 def pretrain_vae(model, dataloader_rna, optimizer, epochs, device, dataloader_spa=None):
-    """
-    Giai đoạn 1: pretrain VAE. Nếu truyền dataloader_spa, mỗi bước còn cộng thêm
-    reconstruction loss của ST qua encoder dùng chung + decoder_tgt.
-    """
     model.to(device)
     model.train()
     history = []
@@ -361,7 +372,12 @@ def pretrain_vae(model, dataloader_rna, optimizer, epochs, device, dataloader_sp
                 mu_s, log_var_s = model.encoder(x_spa)
                 z_s = model.reparameterize(mu_s, log_var_s)
                 x_hat_s = model.decoder_tgt(z_s)
-                loss = loss + reconstruction_loss(x_hat_s, x_spa)
+                # Khớp tâm và phương sai ngay từ Pretrain để 2 decoder không đẩy 2 miền lệch nhau
+                loss_anchor = (
+                    F.mse_loss(mu_s.mean(0), mu.detach().mean(0), reduction="sum")
+                    + F.mse_loss(mu_s.std(0), mu.detach().std(0), reduction="sum")
+                )
+                loss = loss + reconstruction_loss(x_hat_s, x_spa) + 0.5 * loss_anchor
 
             optimizer.zero_grad()
             loss.backward()
