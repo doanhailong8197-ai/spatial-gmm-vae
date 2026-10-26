@@ -116,20 +116,13 @@ class Decoder(nn.Module):
 
 class GMM_VAE(nn.Module):
     """
-    GMM-VAE với Encoder dùng chung và hai Decoder riêng (src: scRNA-seq / tgt: ST).
-    Prior của không gian ẩn z là hỗn hợp Gauss hiệp phương sai chéo với K thành phần.
-
-    Args:
-        encoder, decoder_src, decoder_tgt: các module đã xây dựng.
-        n_clusters: số cụm K của GMM.
-        latent_dim: số chiều không gian ẩn.
-        mu_init_std: độ lệch chuẩn khi khởi tạo ngẫu nhiên tâm cụm.
+    GMM-VAE với mạng nhỏ h_beta dự đoán tâm (mu_c) và phương sai (var_c) 
+    từ chữ ký biểu hiện gene trung bình của K loại tế bào scRNA-seq.
     """
-
-    LOG_VAR_C_MIN, LOG_VAR_C_MAX = -6.0, 4.0
+    SIGMA_MIN, SIGMA_MAX = 0.1, 1.5
 
     def __init__(self, encoder, decoder_src, decoder_tgt,
-                 n_clusters, latent_dim, mu_init_std=1.0):
+                 n_clusters, latent_dim, input_dim=None, prior_hidden_dim=256):
         super().__init__()
         self.encoder = encoder
         self.decoder_src = decoder_src
@@ -137,40 +130,77 @@ class GMM_VAE(nn.Module):
         self.n_clusters = n_clusters
         self.latent_dim = latent_dim
 
-        # Tham số GMM học được qua backprop
+        # Tự động lấy số chiều gene (input_dim) từ lớp Linear đầu tiên của Encoder nếu không truyền vào
+        if input_dim is None:
+            input_dim = encoder.backbone[0].in_features
+        self.input_dim = input_dim
+
+        # Trọng số tiên nghiệm pi_c học được
         self.pi_logits = nn.Parameter(torch.zeros(n_clusters))
-        self.mu_c = nn.Parameter(torch.randn(n_clusters, latent_dim) * mu_init_std)
-        self.log_var_c = nn.Parameter(torch.zeros(n_clusters, latent_dim))
+
+        # Buffer lưu K vector biểu hiện gene trung bình (K, input_dim) của scRNA-seq
+        self.register_buffer("cluster_signatures", torch.zeros(n_clusters, input_dim))
+
+        # Mạng nhỏ h_beta dự đoán tâm mu_c và phương sai var_c trong không gian Euclid tự do
+        self.h_beta = nn.Sequential(
+            nn.Linear(input_dim, prior_hidden_dim),
+            nn.LayerNorm(prior_hidden_dim),
+            nn.GELU(),
+            nn.Linear(prior_hidden_dim, prior_hidden_dim),
+            nn.LayerNorm(prior_hidden_dim),
+            nn.GELU(),
+        )
+        self.mu_head = nn.Linear(prior_hidden_dim, latent_dim)
+        self.sigma_head = nn.Linear(prior_hidden_dim, latent_dim)
+
+        # Khởi tạo trực giao cho mu_head để K tâm cụm ban đầu tách rời nhau
+        nn.init.orthogonal_(self.mu_head.weight, gain=2.0)
+        nn.init.zeros_(self.mu_head.bias)
+        nn.init.zeros_(self.sigma_head.weight)
+        nn.init.zeros_(self.sigma_head.bias)
 
     @property
     def pi(self):
         return torch.softmax(self.pi_logits, dim=0)  # (K,)
 
+    def compute_gmm_params(self):
+        """Chạy mạng h_beta một lần để lấy (mu_c, var_c) có kèm gradient cho backprop."""
+        h = self.h_beta(self.cluster_signatures)
+        mu_c = self.mu_head(h)  # (K, D) - Tự do trong không gian Euclid
+        
+        min_sq, max_sq = self.SIGMA_MIN ** 2, self.SIGMA_MAX ** 2
+        var_c = min_sq + (max_sq - min_sq) * torch.sigmoid(self.sigma_head(h))  # (K, D)
+        return mu_c, var_c
+
+    @property
+    def mu_c(self):
+        mu_c, _ = self.compute_gmm_params()
+        return mu_c
+
     @property
     def var_c(self):
-        return torch.exp(self.log_var_c.clamp(self.LOG_VAR_C_MIN, self.LOG_VAR_C_MAX))  # (K, D)
-
-    @torch.no_grad()
-    def init_gmm_params(self, centers, var=None):
-        """Khởi tạo tâm cụm và phương sai từ bên ngoài."""
-        self.mu_c.copy_(centers)
-        if var is not None:
-            self.log_var_c.copy_(torch.log(var))
+        _, var_c = self.compute_gmm_params()
+        return var_c
 
     @staticmethod
     def reparameterize(mu, log_var):
         std = torch.exp(0.5 * log_var)
         return mu + torch.randn_like(std) * std
 
-    def get_gamma(self, z, pi=None, temperature=1.0):
-        """Tính xác suất hậu nghiệm p(c | z) của từng mẫu thuộc về K cụm."""
-        z = z.unsqueeze(1)             # (B, 1, D)
-        mu_c = self.mu_c.unsqueeze(0)  # (1, K, D)
-        var_c = self.var_c.unsqueeze(0)
+    def get_log_posterior(self, z, pi=None, temperature=1.0, mu_c=None, var_c=None):
+        """
+        Tính log p(c | z) theo Công thức (16) của VaDE dùng cho hàm phạt phân loại L_sc^cls.
+        """
+        if mu_c is None or var_c is None:
+            mu_c, var_c = self.compute_gmm_params()
+
+        z_exp = z.unsqueeze(1)          # (B, 1, D)
+        mu_exp = mu_c.unsqueeze(0)      # (1, K, D)
+        var_exp = var_c.unsqueeze(0)    # (1, K, D)
 
         log_gauss = -0.5 * (
-            math.log(2 * math.pi) + torch.log(var_c) + (z - mu_c).pow(2) / var_c
-        ).sum(dim=2)
+            math.log(2 * math.pi) + torch.log(var_exp + 1e-8) + (z_exp - mu_exp).pow(2) / (var_exp + 1e-8)
+        ).sum(dim=2)  # (B, K)
 
         if pi is None:
             pi = self.pi
@@ -178,43 +208,43 @@ class GMM_VAE(nn.Module):
             pi = pi.unsqueeze(0)
 
         log_joint = torch.log(pi + 1e-10) + log_gauss
-        return torch.softmax(log_joint / temperature, dim=1)
+        return F.log_softmax(log_joint / temperature, dim=1)
+
+    def get_gamma(self, z, pi=None, temperature=1.0):
+        """Tính xác suất hậu nghiệm p(c | z) = exp(log p(c | z))."""
+        return self.get_log_posterior(z, pi=pi, temperature=temperature).exp()
 
     def mahalanobis_sq(self, z):
         """Khoảng cách Mahalanobis bình phương từ z (B, D) tới K cụm -> (B, K)."""
-        diff = z.unsqueeze(1) - self.mu_c.unsqueeze(0)
-        return (diff.pow(2) / self.var_c.unsqueeze(0)).sum(dim=2)
+        mu_c, var_c = self.compute_gmm_params()
+        diff = z.unsqueeze(1) - mu_c.unsqueeze(0)
+        return (diff.pow(2) / (var_c.unsqueeze(0) + 1e-8)).sum(dim=2)
 
     @torch.no_grad()
     def sample_augmented_latent(self, cluster_idx, num_samples, truncation=2.0):
-        """
-        Sinh z_aug ~ N(mu_c, var_c) với nhiễu chuẩn cắt trong [-truncation, truncation].
-        """
+        mu_c, var_c = self.compute_gmm_params()
         if isinstance(cluster_idx, int):
             cluster_idx = torch.full(
-                (num_samples,), cluster_idx, dtype=torch.long, device=self.mu_c.device
+                (num_samples,), cluster_idx, dtype=torch.long, device=mu_c.device
             )
         else:
-            cluster_idx = cluster_idx.to(self.mu_c.device)
-            num_samples = cluster_idx.numel()
+            cluster_idx = cluster_idx.to(mu_c.device)
 
-        mu = self.mu_c[cluster_idx]
-        std = self.var_c[cluster_idx].sqrt()
+        mu = mu_c[cluster_idx]
+        std = var_c[cluster_idx].sqrt()
 
         eps = torch.empty_like(mu)
         nn.init.trunc_normal_(eps, mean=0.0, std=1.0, a=-truncation, b=truncation)
         return mu + eps * std
 
     def forward(self, x, domain):
-        """
-        x: (B, input_dim). domain: 'src' (scRNA-seq) hoặc 'tgt' (ST) để chọn decoder.
-        """
         mu, log_var = self.encoder(x)
         z = self.reparameterize(mu, log_var)
 
         decoder = self.decoder_src if domain == "src" else self.decoder_tgt
         x_hat = decoder(z)
-        gamma = self.get_gamma(z)
+        mu_c, var_c = self.compute_gmm_params()
+        gamma = self.get_log_posterior(z, mu_c=mu_c, var_c=var_c).exp()
 
         return {
             "x_hat": x_hat,
@@ -222,6 +252,8 @@ class GMM_VAE(nn.Module):
             "mu": mu,
             "log_var": log_var,
             "gamma": gamma,
+            "mu_c": mu_c,
+            "var_c": var_c,
         }
 
 
@@ -252,29 +284,45 @@ def gmm_kl_loss(mu, log_var, gamma, model, eps=1e-10):
     return (expected - kl_cat - entropy_q).mean()
 
 
-def supervised_gmm_kl_loss(mu, log_var, cluster_idx, model, detach_gmm=False):
+def supervised_gmm_loss_and_cls(mu, log_var, z_sample, y_rna, model, lambda_cls=1.0, eps=1e-8):
     """
-    Neo trực tiếp biểu diễn (mu, log_var) của miền nguồn vào đúng cụm k = label_to_cluster[y_rna].
-    Giúp giữ cố định ngữ nghĩa từng cụm GMM xuyên suốt quá trình huấn luyện chung mà không cần Giai đoạn 3.
+    Tính đồng thời:
+    1. L_align (Supervised KL): Kéo cả Encoder (mu, log_var) và mạng dự đoán tâm cụm h_beta (mu_c, var_c)
+       khớp với nhau theo nhãn thật y_rna.
+    2. L_sc^cls (Posterior Cross-Entropy): Tối đa hóa log p(c = y_rna | z_sc) theo Công thức (16) của VaDE
+       để đẩy K phân phối Gaussian tách rời nhau, chống gộp cụm.
     """
-    valid = cluster_idx >= 0
+    valid = (y_rna >= 0) & (y_rna < model.n_clusters)
     if not valid.any():
-        return mu.new_zeros(())
+        zero = mu.new_zeros(())
+        return zero, {"align_kl": 0.0, "cls_ce": 0.0}
 
     mu = mu[valid]
     log_var = log_var[valid]
-    cluster_idx = cluster_idx[valid]
+    z_sample = z_sample[valid]
+    y_true = y_rna[valid].long()
 
-    mu_k = model.mu_c[cluster_idx]
-    var_k = model.var_c[cluster_idx]
-    if detach_gmm:
-        mu_k, var_k = mu_k.detach(), var_k.detach()
+    # Lấy tâm cụm và phương sai được dự đoán từ mạng nhỏ h_beta (có gradient truyền về h_beta)
+    mu_c, var_c = model.compute_gmm_params()
 
-    kl = 0.5 * (
-        torch.log(var_k) - log_var + log_var.exp() / var_k
-        + (mu - mu_k).pow(2) / var_k - 1.0
-    ).sum(dim=1)
-    return kl.mean()
+    # ---- 1. L_align: KL( q(z|x_sc) || N(mu_{y_i}, sigma^2_{y_i}) ) ----
+    target_mu = mu_c[y_true]      # (N, J)
+    target_var = var_c[y_true]    # (N, J)
+    tilde_var = log_var.exp()     # \tilde{\sigma}^2_{i,j}
+
+    loss_align = 0.5 * (
+        torch.log(target_var + eps)
+        + (tilde_var + (mu - target_mu).pow(2)) / (target_var + eps)
+        - 1.0
+        - log_var
+    ).sum(dim=1).mean()
+
+    # ---- 2. L_sc^cls: - log p(c = y_sc | z_sc) theo Công thức (16) của VaDE ----
+    log_p_c_given_z = model.get_log_posterior(z_sample, mu_c=mu_c, var_c=var_c)  # (N, K)
+    loss_cls = F.nll_loss(log_p_c_given_z, y_true)
+
+    total_sup_gmm = loss_align + lambda_cls * loss_cls
+    return total_sup_gmm, {"align_kl": loss_align.item(), "cls_ce": loss_cls.item()}
 
 
 def gmm_contrastive_alignment_loss(z_src, z_tgt, model, temperature=0.1,
@@ -395,55 +443,46 @@ def pretrain_vae(model, dataloader_rna, optimizer, epochs, device, dataloader_sp
 
 @torch.no_grad()
 def initialize_gmm_parameters(model, dataloader_rna, n_clusters, device, seed=0):
+    """
+    Tính chữ ký biểu hiện gene trung bình (Pseudobulk Signature) cho từng loại tế bào c
+    từ dữ liệu scRNA-seq và nạp vào model.cluster_signatures để mạng h_beta sử dụng.
+    """
     model.to(device)
     model.eval()
 
-    z_list, y_list = [], []
+    x_sum = torch.zeros(n_clusters, model.input_dim, device=device)
+    counts = torch.zeros(n_clusters, device=device)
+    y_list = []
+
     for x, y, _ in dataloader_rna:
-        mu, _ = model.encoder(x.to(device))
-        z_list.append(mu)
+        x = x.to(device)
+        y = y.to(device).long()
         y_list.append(y)
-    z_all = torch.cat(z_list, dim=0)
-    y_all = torch.cat(y_list, dim=0).to(device)
 
-    labels_np = KMeans(n_clusters=n_clusters, n_init=10, random_state=seed).fit_predict(
-        z_all.cpu().numpy()
-    )
-    labels = torch.from_numpy(labels_np).long().to(device)
+        valid = (y >= 0) & (y < n_clusters)
+        if valid.any():
+            one_hot = F.one_hot(y[valid], num_classes=n_clusters).to(x.dtype)  # (B, K)
+            x_sum += one_hot.T @ x[valid]                                      # (K, input_dim)
+            counts += one_hot.sum(dim=0)                                       # (K,)
 
-    one_hot = F.one_hot(labels, num_classes=n_clusters).to(z_all.dtype)
-    counts = one_hot.sum(dim=0).clamp(min=1.0)
+    # 1. Lưu chữ ký biểu hiện gene trung bình \bar{x}_c^{sc} vào buffer của mô hình
+    signatures = x_sum / counts.clamp(min=1.0).unsqueeze(1)
+    model.cluster_signatures.copy_(signatures)
 
-    pi = counts / counts.sum()
-    mu_c = (one_hot.T @ z_all) / counts.unsqueeze(1)
-    diff = z_all - mu_c[labels]
-    var_c = (one_hot.T @ diff.pow(2)) / counts.unsqueeze(1)
-
-    var_c = var_c.clamp(
-        min=float(np.exp(model.LOG_VAR_C_MIN)),
-        max=float(np.exp(model.LOG_VAR_C_MAX)),
-    )
-    pi = pi.clamp(min=1e-6)
+    # 2. Khởi tạo xác suất tiên nghiệm pi_c theo tỷ lệ mẫu của từng loại tế bào
+    pi = (counts / counts.sum().clamp(min=1.0)).clamp(min=1e-6)
     pi = pi / pi.sum()
-
-    model.mu_c.data.copy_(mu_c)
-    model.log_var_c.data.copy_(torch.log(var_c))
     model.pi_logits.data.copy_(torch.log(pi))
 
-    n_labels = int(y_all.max().item()) + 1
-    contingency = torch.zeros(n_labels, n_clusters, device=device)
-    contingency.index_put_(
-        (y_all, labels), torch.ones_like(y_all, dtype=torch.float), accumulate=True
-    )
-    row, col = linear_sum_assignment(-contingency.cpu().numpy())
-    label_to_cluster = torch.full((n_labels,), -1, dtype=torch.long)
-    label_to_cluster[torch.as_tensor(row)] = torch.as_tensor(col)
+    # 3. Vì cụm c tương ứng trực tiếp với nhãn y = c nên label_to_cluster là ánh xạ đồng nhất [0, 1, ..., K-1]
+    label_to_cluster = torch.arange(n_clusters, dtype=torch.long, device=device)
+    mu_c, var_c = model.compute_gmm_params()
 
     return {
         "pi": pi,
         "mu_c": mu_c,
         "var_c": var_c,
-        "labels": labels,
+        "labels": torch.cat(y_list, dim=0),
         "label_to_cluster": label_to_cluster,
     }
 
@@ -528,29 +567,31 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
             out_rna = model(x_rna, "src")
             out_spa = model(x_spa, "tgt")
 
-            # 1. Reconstruction Loss trên cả hai miền
+            # 1. Reconstruction Loss trên cả hai miền (Tương ứng số hạng E_q[log p_theta(x|z)] trong L_sc^sup)
             loss_recon = (
                 reconstruction_loss(out_rna["x_hat"], x_rna)
                 + reconstruction_loss(out_spa["x_hat"], x_spa)
             )
 
-            # 2. GMM KL Loss trên miền nguồn (kèm neo nhãn nguồn nếu có label_to_cluster)
-            loss_gmm = gmm_kl_loss(
-                out_rna["mu"], out_rna["log_var"], out_rna["gamma"], model
-            )
+            # 2. Nhánh Có giám sát cho scRNA-seq (L_align + L_sc^cls) tối ưu đồng thời Encoder và mạng h_beta
             if label_to_cluster is not None:
                 cluster_rna = label_to_cluster[y_rna]
-                loss_gmm = 0.5 * (
-                    loss_gmm
-                    + supervised_gmm_kl_loss(
-                        out_rna["mu"], out_rna["log_var"], cluster_rna, model
-                    )
-                )
+            else:
+                cluster_rna = y_rna
+
+            loss_gmm, gmm_parts = supervised_gmm_loss_and_cls(
+                mu=out_rna["mu"],
+                log_var=out_rna["log_var"],
+                z_sample=out_rna["z"],
+                y_rna=cluster_rna,
+                model=model,
+                lambda_cls=kwargs.get("lambda_cls", 1.0),
+            )
+
             if gmm_on_target:
                 loss_gmm = loss_gmm + gmm_kl_loss(
                     out_spa["mu"], out_spa["log_var"], out_spa["gamma"], model
                 )
-
             # 3. Tăng cường dữ liệu cho các lớp thiểu số trên miền nguồn
             z_aug = generate_latent_augmentation(
                 model, y_rna, label_to_cluster, truncation
