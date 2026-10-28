@@ -342,83 +342,139 @@ def class_var_stats(mu, y, n_clusters, min_n=3):
             ok[k] = True
     return var, ok
 
-
-def gmm_contrastive_alignment_loss(z_src, z_tgt, model, temperature=0.1,
-                                   radial_weight=1.0, eps=1e-8,
-                                   n_src_real=None,
-                                   pull_weight=1.0, ce_weight=0.5, pull_quantile=0.9,
-                                   gate_quantile=0.95, gate_softness=0.25,   # <-- MỚI
-                                   src_class_var=None, src_class_var_ok=None,
-                                   var_weight=0.5, var_min_n=5, return_parts=False):
+def gmm_contrastive_alignment_loss(
+    z_src, z_tgt, model,
+    x_tgt=None,
+    temperature=0.1,
+    radial_weight=1.0,
+    eps=1e-8,
+    n_src_real=None,
+    pull_weight=1.0,
+    ce_weight=0.5,
+    pull_quantile=0.85,
+    gate_quantile=0.95,
+    gate_softness=0.25,
+    src_class_var=None,
+    src_class_var_ok=None,
+    var_weight=0.5,
+    var_min_n=5,
+    gene_guide_weight=0.5,
+    repel_weight=1.0,
+    ood_prior=0.15,
+    return_parts=False
+):
+    """
+    Hàm căn chỉnh miền nâng cấp:
+    1. Multi-modal Cost (Mahalanobis ẩn + Cosine biểu hiện gene) đưa vào Dustbin Sinkhorn OT.
+    2. Lực Hút (Pull + CE) chỉ tác động lên các mẫu Inlier (trọng số w_in).
+    3. Lực Đẩy (Repulsive Margin Loss) đẩy các mẫu OOD (trọng số w_ood) ra ngoài bán kính chi-square.
+    4. Prototype-Matched Moment Alignment: Khớp tâm và phương sai của Inlier theo đúng tỷ lệ cụm
+       thực tế của ST thay vì Deep CORAL toàn cục.
+    """
     D = z_tgt.size(1)
     z_src_d = z_src.detach()
+    mu_c = model.mu_c.detach()   # (K, D)
+    var_c = model.var_c.detach() # (K, D)
 
-    # ---- 1. Deep CORAL (giữ nguyên) ----
-    mean_src = z_src_d.mean(dim=0, keepdim=True)
-    mean_tgt = z_tgt.mean(dim=0, keepdim=True)
-    loss_mean = F.mse_loss(mean_tgt, mean_src, reduction="sum")
-    zc_src, zc_tgt = z_src_d - mean_src, z_tgt - mean_tgt
-    cov_src = (zc_src.T @ zc_src) / max(z_src_d.size(0) - 1, 1)
-    cov_tgt = (zc_tgt.T @ zc_tgt) / max(z_tgt.size(0) - 1, 1)
-    loss_cov = F.mse_loss(cov_tgt, cov_src, reduction="sum") / D
-    loss_coral = loss_mean + loss_cov
-
-    # ---- 2. Mahalanobis tới K tâm ----
-    mu_c = model.mu_c.detach()
-    var_c = model.var_c.detach()
-    diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)
-    maha_full = (diff.pow(2) / var_c.unsqueeze(0)).sum(dim=2)
-    maha_mean = maha_full / D
+    # ---- 1. Khoảng cách Mahalanobis trung bình chiều trên không gian ẩn ----
+    diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)                     # (N_t, K, D)
+    maha_full = (diff.pow(2) / (var_c.unsqueeze(0) + eps)).sum(dim=2) # (N_t, K)
+    maha_mean = maha_full / D                                         # (N_t, K)
 
     logits = -0.5 * maha_mean / temperature
     log_p = torch.log_softmax(logits, dim=1)
-    p = log_p.exp()
-                                       
-    with torch.no_grad():
-        p_ng = p.detach()
-        f_k = p_ng.sum(dim=0).clamp(min=eps)
-        q = p_ng.pow(2) / f_k.unsqueeze(0)
-        q = q / q.sum(dim=1, keepdim=True).clamp(min=eps)
 
+    # ---- 2. Xác định bán kính cụm từ miền nguồn & Giải Dustbin OT ----
+    with torch.no_grad():
         z_real = z_src_d if n_src_real is None else z_src_d[:n_src_real]
         d_real = ((z_real.unsqueeze(1) - mu_c.unsqueeze(0)).pow(2)
-                  / var_c.unsqueeze(0)).sum(dim=2) / D
+                  / (var_c.unsqueeze(0) + eps)).sum(dim=2) / D
         d_real_min = d_real.min(dim=1).values
 
-        r = torch.quantile(d_real_min, pull_quantile).sqrt().clamp(min=1e-3)
+        # Bán kính hút (trong cụm) và ngưỡng ranh giới OOD
+        r_in = torch.quantile(d_real_min, pull_quantile).sqrt().clamp(min=1e-3)
+        d_thr = torch.quantile(d_real_min, gate_quantile).clamp(min=0.5)
+        # Bán kính đẩy OOD: nằm ngoài ngưỡng chi-square chuẩn hóa theo chiều D
+        chi2_norm_thr = float(chi2_dist.ppf(0.95, df=D)) / D
+        r_out = max(d_thr.sqrt().item() * 1.25, math.sqrt(chi2_norm_thr))
 
-        d_thr = torch.quantile(d_real_min, gate_quantile).clamp(min=eps)
+        # Kết hợp chi phí biểu hiện gene (Cosine distance) để dẫn đường khi 2 miền chưa overlap
+        cost_latent = maha_mean / (d_thr + eps)  # Chuẩn hóa về thang ~1.0 tại ranh giới cụm
+        if x_tgt is not None and gene_guide_weight > 0.0:
+            x_norm = F.normalize(x_tgt.detach(), p=2, dim=1)
+            sig_norm = F.normalize(model.cluster_signatures.detach(), p=2, dim=1)
+            cos_sim = x_norm @ sig_norm.T                       # (N_t, K) trong [-1, 1]
+            cost_gene = 1.0 - cos_sim                           # (N_t, K) trong [0, 2]
+            # Chuẩn hóa min-max theo hàng để tương thích thang đo với cost_latent
+            cost_gene = cost_gene / (cost_gene.median().clamp(min=0.1))
+            combined_cost = (1.0 - gene_guide_weight) * cost_latent + gene_guide_weight * cost_gene
+        else:
+            combined_cost = cost_latent
+
+        # Ngưỡng chi phí vào cột Dustbin (Unknown): mẫu có cost > 1.0 (tức vượt d_thr) sẽ ưu tiên vào OOD
+        q, w_in_ot, w_ood_ot = _sinkhorn_with_dustbin(
+            combined_cost,
+            dustbin_cost=1.05,
+            reg=max(temperature, 0.08),
+            ood_prior=ood_prior,
+            cluster_prior=model.pi.detach(),
+        )
+
+        # Kết hợp cổng năng lượng mượt và xác suất từ Dustbin OT
         min_d = maha_mean.min(dim=1).values
-        w = torch.sigmoid((d_thr - min_d) / (gate_softness * d_thr + eps))
+        w_gate = torch.sigmoid((d_thr - min_d) / (gate_softness * d_thr + eps))
+        w_in = (0.5 * w_in_ot + 0.5 * w_gate).clamp(min=0.0, max=1.0)
+        w_ood = (1.0 - w_in).clamp(min=0.0, max=1.0)
 
-    # Lực 1: CE (giảm hệ số)
+    # ---- 3. Lực HÚT cho tế bào Known (Inliers) ----
     loss_ce = -(q * log_p).sum(dim=1)
+    d_k = torch.sqrt(maha_mean + eps)                           # (N_t, K)
+    excess_in = F.relu(d_k - r_in)
+    loss_pull = (q * _pseudo_huber(excess_in, r_in)).sum(dim=1)
 
-    # Lực 2: pull dùng maha_mean, vùng chết trong bán kính r, ngoài r dùng pseudo-Huber
-    d_k = torch.sqrt(maha_mean + eps)                 # (N_t, K), cùng thang với r
-    excess = F.relu(d_k - r)
-    loss_pull = (q * _pseudo_huber(excess, r)).sum(dim=1)
+    loss_inlier = (w_in * (pull_weight * loss_pull + ce_weight * loss_ce)).sum() / (w_in.sum() + eps)
 
-    loss_cluster = (w * (pull_weight * loss_pull + ce_weight * loss_ce)).sum() / (w.sum() + eps)
+    # ---- 4. Lực ĐẨY (Repulsive Margin) tách tế bào Unknown (OOD) ra khỏi cụm Known ----
+    # Đẩy khoảng cách tới cụm gần nhất vượt ra ngoài bán kính an toàn r_out
+    d_min = d_k.min(dim=1).values                               # (N_t,)
+    margin_violation = F.relu(r_out - d_min)
+    loss_repel = (w_ood * margin_violation.pow(2)).sum() / (w_ood.sum() + eps)
 
-    # ---- 3. Khớp phương sai nội cụm ST với scRNA (chống nén quá mức) ----
+    # ---- 5. Prototype-Conditional Moment Alignment (Thay cho Deep CORAL toàn cục) ----
+    # Chỉ khớp các điểm Inlier với tâm kỳ vọng theo phân bố cụm thực tế của miền ST (tránh bẫy lệch tỷ lệ lớp & OOD)
+    w_in_norm = (w_in / (w_in.sum() + eps)).unsqueeze(1)        # (N_t, 1)
+    expected_tgt_anchors = q @ mu_c                             # (N_t, D) tâm mục tiêu của từng điểm ST
+    mean_tgt_inlier = (w_in_norm * z_tgt).sum(dim=0)
+    mean_anchor_inlier = (w_in_norm * expected_tgt_anchors).sum(dim=0)
+    loss_coral_inlier = F.mse_loss(mean_tgt_inlier, mean_anchor_inlier, reduction="sum")
+
+    # ---- 6. Khớp phương sai nội cụm ST với scRNA (chống nén cụm quá mức) ----
     loss_var = z_tgt.new_zeros(())
     if src_class_var is not None:
-        qw = q * w.unsqueeze(1)                                        # (N_t, K), không gradient
-        n_k = qw.sum(dim=0)                                            # (K,)
+        qw = q * w_in.unsqueeze(1)                              # (N_t, K)
+        n_k = qw.sum(dim=0)                                     # (K,)
         denom = n_k.clamp(min=eps).unsqueeze(1)
-        mean_k = (qw.T @ z_tgt) / denom                                # (K, D)
-        sq = (z_tgt.unsqueeze(1) - mean_k.unsqueeze(0)).pow(2)         # (N_t, K, D)
-        var_k = ((qw.unsqueeze(2) * sq).sum(dim=0) / denom).mean(dim=1)  # (K,)
+        mean_k = (qw.T @ z_tgt) / denom                         # (K, D)
+        sq = (z_tgt.unsqueeze(1) - mean_k.unsqueeze(0)).pow(2)  # (N_t, K, D)
+        var_k = ((qw.unsqueeze(2) * sq).sum(dim=0) / denom).mean(dim=1)
         ok = src_class_var_ok & (n_k >= var_min_n)
         if ok.any():
-            loss_var = (torch.log(var_k[ok] + eps)
-                        - torch.log(src_class_var[ok] + eps)).pow(2).mean()
+            loss_var = (torch.log(var_k[ok] + eps) - torch.log(src_class_var[ok] + eps)).pow(2).mean()
 
-    total = loss_cluster + radial_weight * loss_coral + var_weight * loss_var
+    total = (
+        loss_inlier
+        + repel_weight * loss_repel
+        + radial_weight * loss_coral_inlier
+        + var_weight * loss_var
+    )
     if return_parts:
-        return total, {"var": loss_var.item(), "r": r.item(),
-                       "pull": ((w * loss_pull).sum() / (w.sum() + eps)).item()}
+        return total, {
+            "var": loss_var.item(),
+            "r": r_in.item(),
+            "pull": ((w_in * loss_pull).sum() / (w_in.sum() + eps)).item(),
+            "repel": loss_repel.item(),
+            "ood_frac": (w_ood > 0.5).float().mean().item(),
+        }
     return total
 
 # =====================================================================
@@ -475,49 +531,136 @@ def pretrain_vae(model, dataloader_rna, optimizer, epochs, device, dataloader_sp
 
 
 @torch.no_grad()
-def initialize_gmm_parameters(model, dataloader_rna, n_clusters, device, seed=0):
+def initialize_gmm_parameters(model, dataloader_rna, n_clusters, device,
+                              warmup_steps=200, lr_hbeta=1e-3, seed=0):
     """
-    Tính chữ ký biểu hiện gene trung bình (Pseudobulk Signature) cho từng loại tế bào c
-    từ dữ liệu scRNA-seq và nạp vào model.cluster_signatures để mạng h_beta sử dụng.
+    1. Tính chữ ký biểu hiện gene trung bình (Pseudobulk Signature) cho K cụm.
+    2. Tính tâm thực nghiệm (emp_mu, emp_var) của scRNA-seq trên Encoder đã pretrain.
+    3. Khớp ấm (warm-start) mạng h_beta để mu_c, var_c trùng với đám mây ẩn thực tế
+       ngay trước khi bước vào Giai đoạn 2.
     """
     model.to(device)
     model.eval()
 
     x_sum = torch.zeros(n_clusters, model.input_dim, device=device)
+    z_sum = torch.zeros(n_clusters, model.latent_dim, device=device)
+    z_sq_sum = torch.zeros(n_clusters, model.latent_dim, device=device)
     counts = torch.zeros(n_clusters, device=device)
     y_list = []
 
-    for x, y, _ in dataloader_rna:
-        x = x.to(device)
-        y = y.to(device).long()
-        y_list.append(y)
+    with torch.no_grad():
+        for x, y, _ in dataloader_rna:
+            x = x.to(device)
+            y = y.to(device).long()
+            y_list.append(y)
 
-        valid = (y >= 0) & (y < n_clusters)
-        if valid.any():
-            one_hot = F.one_hot(y[valid], num_classes=n_clusters).to(x.dtype)  # (B, K)
-            x_sum += one_hot.T @ x[valid]                                      # (K, input_dim)
-            counts += one_hot.sum(dim=0)                                       # (K,)
+            valid = (y >= 0) & (y < n_clusters)
+            if valid.any():
+                x_v, y_v = x[valid], y[valid]
+                mu_v, _ = model.encoder(x_v)
+                one_hot = F.one_hot(y_v, num_classes=n_clusters).to(x.dtype)  # (B, K)
 
-    # 1. Lưu chữ ký biểu hiện gene trung bình \bar{x}_c^{sc} vào buffer của mô hình
-    signatures = x_sum / counts.clamp(min=1.0).unsqueeze(1)
-    model.cluster_signatures.copy_(signatures)
+                x_sum += one_hot.T @ x_v
+                z_sum += one_hot.T @ mu_v
+                z_sq_sum += one_hot.T @ (mu_v ** 2)
+                counts += one_hot.sum(dim=0)
 
-    # 2. Khởi tạo xác suất tiên nghiệm pi_c theo tỷ lệ mẫu của từng loại tế bào
-    pi = (counts / counts.sum().clamp(min=1.0)).clamp(min=1e-6)
-    pi = pi / pi.sum()
-    model.pi_logits.data.copy_(torch.log(pi))
+        denom = counts.clamp(min=1.0).unsqueeze(1)
+        signatures = x_sum / denom
+        model.cluster_signatures.copy_(signatures)
 
-    # 3. Vì cụm c tương ứng trực tiếp với nhãn y = c nên label_to_cluster là ánh xạ đồng nhất [0, 1, ..., K-1]
+        emp_mu = z_sum / denom
+        emp_var = (z_sq_sum / denom - emp_mu ** 2).clamp(
+            min=model.SIGMA_MIN ** 2 + 1e-4, max=model.SIGMA_MAX ** 2 - 1e-4
+        )
+
+        pi = (counts / counts.sum().clamp(min=1.0)).clamp(min=1e-6)
+        pi = pi / pi.sum()
+        model.pi_logits.data.copy_(torch.log(pi))
+
+    # --- Bước quan trọng: Huấn luyện ấm h_beta khớp với (emp_mu, emp_var) ---
+    hbeta_params = (
+        list(model.h_beta.parameters())
+        + list(model.mu_head.parameters())
+        + list(model.sigma_head.parameters())
+    )
+    opt_hb = torch.optim.Adam(hbeta_params, lr=lr_hbeta)
+    has_samples = counts > 0
+
+    for _ in range(warmup_steps):
+        mu_c, var_c = model.compute_gmm_params()
+        loss_hb = (
+            F.mse_loss(mu_c[has_samples], emp_mu[has_samples])
+            + F.mse_loss(var_c[has_samples], emp_var[has_samples])
+        )
+        opt_hb.zero_grad()
+        loss_hb.backward()
+        opt_hb.step()
+
+    with torch.no_grad():
+        mu_c, var_c = model.compute_gmm_params()
+
     label_to_cluster = torch.arange(n_clusters, dtype=torch.long, device=device)
-    mu_c, var_c = model.compute_gmm_params()
-
     return {
         "pi": pi,
-        "mu_c": mu_c,
-        "var_c": var_c,
+        "mu_c": mu_c.detach(),
+        "var_c": var_c.detach(),
         "labels": torch.cat(y_list, dim=0),
         "label_to_cluster": label_to_cluster,
     }
+
+def _sinkhorn_with_dustbin(cost_matrix, dustbin_cost, reg=0.1,
+                           ood_prior=0.15, cluster_prior=None, n_iters=25):
+    """
+    Giải bài toán Optimal Transport có kênh rác (Dustbin / Unknown cột K+1):
+    - cost_matrix: (N_t, K) chi phí giữa tế bào đích và K cụm Known.
+    - dustbin_cost: (N_t, 1) hoặc scalar ngưỡng chi phí để đẩy mẫu vào kênh Unknown.
+    Trả về:
+        q_known: (N_t, K) phân phối gán cụm mềm đã chuẩn hóa trên các cụm Known.
+        w_in:    (N_t,) xác suất mẫu đích thuộc tập Known (Inlier weight).
+        w_ood:   (N_t,) xác suất mẫu đích là Unknown / OOD.
+    """
+    N_t, K = cost_matrix.shape
+    device = cost_matrix.device
+
+    if not torch.is_tensor(dustbin_cost):
+        dustbin_col = torch.full((N_t, 1), float(dustbin_cost), device=device)
+    else:
+        dustbin_col = dustbin_cost.view(-1, 1).expand(N_t, 1)
+
+    # Ma trận chi phí mở rộng (N_t, K + 1)
+    C_ext = torch.cat([cost_matrix, dustbin_col], dim=1)
+
+    # Log-kernel Boltzmann
+    log_P = -C_ext / max(reg, 1e-4)
+
+    # Phân phối biên của cột: (1 - ood_prior) phân bổ cho K cụm, ood_prior cho cột Unknown
+    if cluster_prior is None:
+        col_known = torch.full((K,), (1.0 - ood_prior) / K, device=device)
+    else:
+        col_known = (cluster_prior / cluster_prior.sum().clamp(min=1e-8)) * (1.0 - ood_prior)
+    col_target = torch.cat([col_known, torch.tensor([ood_prior], device=device)], dim=0)
+    log_col_target = torch.log(col_target.clamp(min=1e-8)).unsqueeze(0)  # (1, K+1)
+
+    # Chuẩn hóa Sinkhorn xen kẽ hàng - cột trong miền log (ổn định số học)
+    # Lưu ý: Nới lỏng chuẩn hóa cột (soft marginal relaxation) để chịu được lệch tỷ lệ lớp ST
+    col_relax = 0.5
+    for _ in range(n_iters):
+        # Chuẩn hóa hàng (mỗi tế bào có tổng xác suất = 1)
+        log_P = log_P - torch.logsumexp(log_P, dim=1, keepdim=True)
+        # Chuẩn hóa cột có hệ số co giãn (Unbalanced / Relaxed column marginal)
+        log_col_sum = torch.logsumexp(log_P, dim=0, keepdim=True) - math.log(max(N_t, 1))
+        log_P = log_P + col_relax * (log_col_target - log_col_sum)
+
+    log_P = log_P - torch.logsumexp(log_P, dim=1, keepdim=True)
+    P = log_P.exp()  # (N_t, K + 1)
+
+    w_ood = P[:, K].clamp(min=0.0, max=1.0)
+    w_in = (1.0 - w_ood).clamp(min=0.0, max=1.0)
+
+    q_known = P[:, :K]
+    q_known = q_known / q_known.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    return q_known, w_in, w_ood
 
 
 # =====================================================================
@@ -567,22 +710,10 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
                         gmm_on_target=False,
                         align_temp=0.1, radial_weight=0.5,
                         warmup_epochs=10, pull_weight=1.0, ce_weight=0.5,
-                        pull_quantile=0.9, var_weight=0.5, var_ema=0.9,
-                        gate_quantile=0.95, gate_softness=0.25, 
-                        ot_mode=None, ot_reg=None, ot_tau_s=None, ot_tau_t=None,
-                        ot_iters=None, **kwargs):
-    """
-    Huấn luyện chung GMM-VAE (Giai đoạn 2) với Energy-Gated Contrastive GMM Alignment
-    + Radial Moment Matching thay cho Optimal Transport.
-
-    Args:
-        lambda_1: Trọng số GMM KL loss.
-        lambda_2: Trọng số alignment loss (contrastive + radial).
-        label_to_cluster: Ánh xạ nhãn scRNA-seq -> cụm GMM để neo tâm cụm.
-        align_temp: Nhiệt độ Boltzmann của alignment loss.
-        radial_weight: Trọng số thành phần Radial Moment Matching.
-        ot_*, **kwargs: được chấp nhận nhưng bỏ qua (tương thích ngược).
-    """
+                        pull_quantile=0.85, var_weight=0.5, var_ema=0.9,
+                        gate_quantile=0.95, gate_softness=0.25,
+                        repel_weight=1.0, ood_prior=0.15,
+                        **kwargs):
     model.to(device)
     model.train()
     spa_iter = _infinite_loader(dataloader_spa)
@@ -591,16 +722,16 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
     if label_to_cluster is not None:
         label_to_cluster = label_to_cluster.to(device)
 
-    
     K = model.n_clusters
-    src_var = torch.zeros(K, device=device)                       # EMA phương sai lớp của scRNA
+    src_var = torch.zeros(K, device=device)
     src_ok = torch.zeros(K, dtype=torch.bool, device=device)
     total_warm = max(warmup_epochs * len(dataloader_rna), 1)
+    total_steps = max(epochs * len(dataloader_rna), 1)
     global_step = 0
 
     for epoch in range(epochs):
         sums = {"total": 0.0, "recon": 0.0, "gmm": 0.0, "ot": 0.0, "n_aug": 0,
-                "var": 0.0, "pull": 0.0}
+                "var": 0.0, "pull": 0.0, "repel": 0.0, "ood_frac": 0.0}
         n_steps = 0
 
         for x_rna, y_rna, _ in dataloader_rna:
@@ -610,19 +741,18 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
             out_rna = model(x_rna, "src")
             out_spa = model(x_spa, "tgt")
 
-            # 1. Reconstruction Loss trên cả hai miền (Tương ứng số hạng E_q[log p_theta(x|z)] trong L_sc^sup)
+            # 1. Reconstruction Loss + Neo chữ ký tâm cụm qua decoder_src
+            sig_hat = model.decoder_src(out_rna["mu_c"])
+            loss_sig_anchor = reconstruction_loss(sig_hat, model.cluster_signatures)
             loss_recon = (
                 reconstruction_loss(out_rna["x_hat"], x_rna)
                 + reconstruction_loss(out_spa["x_hat"], x_spa)
+                + 0.2 * loss_sig_anchor
             )
 
-            # 2. Nhánh Có giám sát cho scRNA-seq (L_align + L_sc^cls) tối ưu đồng thời Encoder và mạng h_beta
-            if label_to_cluster is not None:
-                cluster_rna = label_to_cluster[y_rna]
-            else:
-                cluster_rna = y_rna
-
-            loss_gmm, gmm_parts = supervised_gmm_loss_and_cls(
+            # 2. Nhánh Có giám sát cho scRNA-seq (L_align + L_sc^cls)
+            cluster_rna = label_to_cluster[y_rna] if label_to_cluster is not None else y_rna
+            loss_gmm, _ = supervised_gmm_loss_and_cls(
                 mu=out_rna["mu"],
                 log_var=out_rna["log_var"],
                 z_sample=out_rna["z"],
@@ -635,10 +765,9 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
                 loss_gmm = loss_gmm + gmm_kl_loss(
                     out_spa["mu"], out_spa["log_var"], out_spa["gamma"], model
                 )
-            # 3. Tăng cường dữ liệu cho các lớp thiểu số trên miền nguồn
-            z_aug = generate_latent_augmentation(
-                model, y_rna, label_to_cluster, truncation
-            )
+
+            # 3. Tăng cường dữ liệu cho các lớp thiểu số trên miền nguồn (Đã sửa để đưa vào z_src_all)
+            z_aug = generate_latent_augmentation(model, y_rna, label_to_cluster, truncation)
             n_aug = 0
             if z_aug is not None:
                 z_src_all = torch.cat([out_rna["mu"], z_aug], dim=0)
@@ -646,7 +775,7 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
             else:
                 z_src_all = out_rna["mu"]
 
-            # 4. Energy-Gated Contrastive GMM Alignment + Radial Moment Matching
+            # 4. Cập nhật EMA phương sai nội cụm miền nguồn
             with torch.no_grad():
                 v_b, ok_b = class_var_stats(out_rna["mu"].detach(), cluster_rna, K)
                 first, upd = ok_b & ~src_ok, ok_b & src_ok
@@ -654,39 +783,41 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
                 src_var[upd] = var_ema * src_var[upd] + (1 - var_ema) * v_b[upd]
                 src_ok |= ok_b
 
+            # Hệ số dẫn đường bằng biểu hiện gene giảm dần khi 2 miền đã khớp (từ 0.6 xuống 0.15)
+            progress = min(1.0, global_step / total_steps)
+            gene_guide_w = 0.6 * (1.0 - progress) + 0.15 * progress
+
+            # 5. Gọi hàm căn chỉnh 1 lần duy nhất với đầy đủ z_src_all và x_tgt
             loss_align, a_parts = gmm_contrastive_alignment_loss(
-                z_src=out_rna["mu"],
+                z_src=z_src_all,
                 z_tgt=out_spa["mu"],
                 model=model,
+                x_tgt=x_spa,
                 temperature=align_temp,
                 radial_weight=radial_weight,
                 n_src_real=out_rna["mu"].size(0),
-                pull_weight=pull_weight, ce_weight=ce_weight, pull_quantile=pull_quantile,
-                gate_quantile=gate_quantile, gate_softness=gate_softness,
-                src_class_var=src_var, src_class_var_ok=src_ok, var_weight=var_weight,
-                return_parts=True,
-            )
-            loss_align, a_parts = gmm_contrastive_alignment_loss(
-                #z_src=z_src_all,
-                z_src=out_rna["mu"],
-                z_tgt=out_spa["mu"],
-                model=model,
-                temperature=align_temp,
-                radial_weight=radial_weight,
-                n_src_real=out_rna["mu"].size(0),
-                pull_weight=pull_weight, ce_weight=ce_weight, pull_quantile=pull_quantile,
-                src_class_var=src_var, src_class_var_ok=src_ok, var_weight=var_weight,
+                pull_weight=pull_weight,
+                ce_weight=ce_weight,
+                pull_quantile=pull_quantile,
+                gate_quantile=gate_quantile,
+                gate_softness=gate_softness,
+                src_class_var=src_var,
+                src_class_var_ok=src_ok,
+                var_weight=var_weight,
+                gene_guide_weight=gene_guide_w,
+                repel_weight=repel_weight,
+                ood_prior=ood_prior,
                 return_parts=True,
             )
 
-            ramp = min(1.0, (global_step + 1) / total_warm)   # warm-up tuyến tính theo step
+            # Sửa lỗi ghi đè ramp: giữ nguyên hiệu lực của warm-up tuyến tính
+            ramp = min(1.0, (global_step + 1) / total_warm)
             global_step += 1
             loss_total = loss_recon + lambda_1 * loss_gmm + (lambda_2 * ramp) * loss_align
 
-            loss_total = loss_recon + lambda_1 * loss_gmm + lambda_2 * loss_align
-
             optimizer.zero_grad()
             loss_total.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
 
             sums["total"] += loss_total.item()
@@ -695,6 +826,8 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
             sums["ot"] += loss_align.item()
             sums["var"] += a_parts["var"]
             sums["pull"] += a_parts["pull"]
+            sums["repel"] += a_parts["repel"]
+            sums["ood_frac"] += a_parts["ood_frac"]
             sums["n_aug"] += n_aug
             n_steps += 1
 
@@ -704,7 +837,8 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
         print(
             f"[Joint-Align] Epoch {epoch + 1}/{epochs} - total: {stats['total']:.4f} | "
             f"recon: {stats['recon']:.4f} | gmm: {stats['gmm']:.4f} | "
-            f"align: {stats['ot']:.4f} | z_aug/batch: {stats['n_aug']:.1f}"
+            f"align: {stats['ot']:.4f} (pull: {stats['pull']:.3f}, repel: {stats['repel']:.3f}) | "
+            f"est_OOD: {stats['ood_frac']:.1%}"
         )
 
     return history
