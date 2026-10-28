@@ -373,23 +373,23 @@ def gmm_contrastive_alignment_loss(z_src, z_tgt, model, temperature=0.1,
     logits = -0.5 * maha_mean / temperature
     log_p = torch.log_softmax(logits, dim=1)
     p = log_p.exp()
-
+                                       
     with torch.no_grad():
         p_ng = p.detach()
         f_k = p_ng.sum(dim=0).clamp(min=eps)
         q = p_ng.pow(2) / f_k.unsqueeze(0)
         q = q / q.sum(dim=1, keepdim=True).clamp(min=eps)
 
-        min_d = maha_mean.min(dim=1).values
-        med_d = min_d.median()
-        mad_d = (min_d - med_d).abs().median() * 1.4826 + eps
-        w = torch.sigmoid(-(min_d - (med_d + 0.5 * mad_d)) / (mad_d + eps))
-
-        # Bán kính tin cậy lấy từ CHÍNH scRNA thật: quantile của khoảng cách tới tâm gần nhất
         z_real = z_src_d if n_src_real is None else z_src_d[:n_src_real]
         d_real = ((z_real.unsqueeze(1) - mu_c.unsqueeze(0)).pow(2)
                   / var_c.unsqueeze(0)).sum(dim=2) / D
-        r = torch.quantile(d_real.min(dim=1).values, pull_quantile).sqrt().clamp(min=1e-3)
+        d_real_min = d_real.min(dim=1).values
+
+        r = torch.quantile(d_real_min, pull_quantile).sqrt().clamp(min=1e-3)
+
+        d_thr = torch.quantile(d_real_min, gate_quantile).clamp(min=eps)
+        min_d = maha_mean.min(dim=1).values
+        w = torch.sigmoid((d_thr - min_d) / (gate_softness * d_thr + eps))
 
     # Lực 1: CE (giảm hệ số)
     loss_ce = -(q * log_p).sum(dim=1)
@@ -568,6 +568,7 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
                         align_temp=0.1, radial_weight=0.5,
                         warmup_epochs=10, pull_weight=1.0, ce_weight=0.5,
                         pull_quantile=0.9, var_weight=0.5, var_ema=0.9,
+                        gate_quantile=0.95, gate_softness=0.25, 
                         ot_mode=None, ot_reg=None, ot_tau_s=None, ot_tau_t=None,
                         ot_iters=None, **kwargs):
     """
@@ -647,24 +648,24 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
 
             # 4. Energy-Gated Contrastive GMM Alignment + Radial Moment Matching
             with torch.no_grad():
-                p_ng = p.detach()
-                f_k = p_ng.sum(dim=0).clamp(min=eps)
-                q = p_ng.pow(2) / f_k.unsqueeze(0)
-                q = q / q.sum(dim=1, keepdim=True).clamp(min=eps)
-        
-                # Khoảng cách tới tâm gần nhất của scRNA THẬT (cùng thang maha_mean)
-                z_real = z_src_d if n_src_real is None else z_src_d[:n_src_real]
-                d_real = ((z_real.unsqueeze(1) - mu_c.unsqueeze(0)).pow(2)
-                          / var_c.unsqueeze(0)).sum(dim=2) / D
-                d_real_min = d_real.min(dim=1).values
-        
-                # Bán kính tin cậy cho lực pull (giữ nguyên)
-                r = torch.quantile(d_real_min, pull_quantile).sqrt().clamp(min=1e-3)
-        
-                # Cổng "thật sự gần một cụm": ngưỡng tuyệt đối hiệu chỉnh từ scRNA thật
-                d_thr = torch.quantile(d_real_min, gate_quantile).clamp(min=eps)
-                min_d = maha_mean.min(dim=1).values
-                w = torch.sigmoid((d_thr - min_d) / (gate_softness * d_thr + eps))
+                v_b, ok_b = class_var_stats(out_rna["mu"].detach(), cluster_rna, K)
+                first, upd = ok_b & ~src_ok, ok_b & src_ok
+                src_var[first] = v_b[first]
+                src_var[upd] = var_ema * src_var[upd] + (1 - var_ema) * v_b[upd]
+                src_ok |= ok_b
+
+            loss_align, a_parts = gmm_contrastive_alignment_loss(
+                z_src=out_rna["mu"],
+                z_tgt=out_spa["mu"],
+                model=model,
+                temperature=align_temp,
+                radial_weight=radial_weight,
+                n_src_real=out_rna["mu"].size(0),
+                pull_weight=pull_weight, ce_weight=ce_weight, pull_quantile=pull_quantile,
+                gate_quantile=gate_quantile, gate_softness=gate_softness,
+                src_class_var=src_var, src_class_var_ok=src_ok, var_weight=var_weight,
+                return_parts=True,
+            )
             loss_align, a_parts = gmm_contrastive_alignment_loss(
                 #z_src=z_src_all,
                 z_src=out_rna["mu"],
