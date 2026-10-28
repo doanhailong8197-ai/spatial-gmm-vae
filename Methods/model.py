@@ -325,40 +325,49 @@ def supervised_gmm_loss_and_cls(mu, log_var, z_sample, y_rna, model, lambda_cls=
     return total_sup_gmm, {"align_kl": loss_align.item(), "cls_ce": loss_cls.item()}
 
 
+def _pseudo_huber(x, delta):
+    """Gradient bị chặn trên bởi delta, trơn tại 0."""
+    return delta ** 2 * (torch.sqrt(1.0 + (x / delta) ** 2) - 1.0)
+
+
+@torch.no_grad()
+def class_var_stats(mu, y, n_clusters, min_n=3):
+    """Phương sai nội cụm (trung bình theo chiều) của từng lớp -> (var[K], ok[K])."""
+    var = mu.new_zeros(n_clusters)
+    ok = torch.zeros(n_clusters, dtype=torch.bool, device=mu.device)
+    for k in range(n_clusters):
+        m = mu[y == k]
+        if m.size(0) >= min_n:
+            var[k] = m.var(dim=0, unbiased=True).mean()
+            ok[k] = True
+    return var, ok
+
+
 def gmm_contrastive_alignment_loss(z_src, z_tgt, model, temperature=0.1,
-                                   radial_weight=1.0, eps=1e-8):
-    """
-    Hybrid Mode-Seeking GMM Alignment:
-    1. Deep CORAL (Mean + Full Covariance Alignment): Xoay và khớp toàn bộ hình học toàn cục
-       của đám mây ST trùng lên đám mây scRNA-seq (chống lệch trục song song trên UMAP/t-SNE).
-    2. Direct Mahalanobis Pull + Sharpened Contrastive Loss:
-       - Contrastive đẩy điểm ST ra khỏi vùng tranh chấp giữa các cụm.
-       - Direct Mahalanobis Pull kéo thẳng điểm ST đi vào tâm cụm mu_c (không bị bão hòa
-         sớm ở rìa cụm như Softmax thuần túy).
-    3. Free-Energy Soft Gate (w_i): Bảo vệ tế bào Unknown (OOD) một cách liên tục.
-    """
+                                   radial_weight=1.0, eps=1e-8,
+                                   n_src_real=None,            # số điểm scRNA THẬT ở đầu z_src (phần sau là z_aug)
+                                   pull_weight=1.0, ce_weight=0.5, pull_quantile=0.9,
+                                   src_class_var=None, src_class_var_ok=None,
+                                   var_weight=0.5, var_min_n=5, return_parts=False):
     D = z_tgt.size(1)
     z_src_d = z_src.detach()
 
-    # ---- 1. Deep CORAL: Khớp Mean + Full Covariance Matrix (D x D) ----
+    # ---- 1. Deep CORAL (giữ nguyên) ----
     mean_src = z_src_d.mean(dim=0, keepdim=True)
     mean_tgt = z_tgt.mean(dim=0, keepdim=True)
     loss_mean = F.mse_loss(mean_tgt, mean_src, reduction="sum")
-
-    zc_src = z_src_d - mean_src
-    zc_tgt = z_tgt - mean_tgt
+    zc_src, zc_tgt = z_src_d - mean_src, z_tgt - mean_tgt
     cov_src = (zc_src.T @ zc_src) / max(z_src_d.size(0) - 1, 1)
     cov_tgt = (zc_tgt.T @ zc_tgt) / max(z_tgt.size(0) - 1, 1)
     loss_cov = F.mse_loss(cov_tgt, cov_src, reduction="sum") / D
     loss_coral = loss_mean + loss_cov
 
-    # ---- 2. Khoảng cách Mahalanobis tới K tâm cụm GMM nguồn ----
-    mu_c = model.mu_c.detach()        # (K, D)
-    var_c = model.var_c.detach()      # (K, D)
-
-    diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)            # (N_t, K, D)
-    maha_full = (diff.pow(2) / var_c.unsqueeze(0)).sum(dim=2) # (N_t, K) - cùng thang đo với KL
-    maha_mean = maha_full / D                                 # (N_t, K) - chuẩn hóa theo chiều D
+    # ---- 2. Mahalanobis tới K tâm ----
+    mu_c = model.mu_c.detach()
+    var_c = model.var_c.detach()
+    diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)
+    maha_full = (diff.pow(2) / var_c.unsqueeze(0)).sum(dim=2)
+    maha_mean = maha_full / D
 
     logits = -0.5 * maha_mean / temperature
     log_p = torch.log_softmax(logits, dim=1)
@@ -366,27 +375,50 @@ def gmm_contrastive_alignment_loss(z_src, z_tgt, model, temperature=0.1,
 
     with torch.no_grad():
         p_ng = p.detach()
-        # Phân phối mục tiêu DEC sắc nét, cân bằng tần suất cụm
         f_k = p_ng.sum(dim=0).clamp(min=eps)
-        q = (p_ng.pow(2) / f_k.unsqueeze(0))
+        q = p_ng.pow(2) / f_k.unsqueeze(0)
         q = q / q.sum(dim=1, keepdim=True).clamp(min=eps)
 
-        # Cổng trọng số mềm theo khoảng cách Mahalanobis nhỏ nhất (Free Energy)
         min_d = maha_mean.min(dim=1).values
         med_d = min_d.median()
         mad_d = (min_d - med_d).abs().median() * 1.4826 + eps
-        # Điểm Known (min_d <= med_d + mad_d) có w ≈ 1; điểm OOD xa có w giảm mượt về nhỏ
         w = torch.sigmoid(-(min_d - (med_d + 0.5 * mad_d)) / (mad_d + eps))
 
-    # Lực 1: Contrastive Cross-Entropy (phân tách ranh giới giữa các cụm)
-    loss_ce = -(q * log_p).sum(dim=1)                        # (N_t,)
+        # Bán kính tin cậy lấy từ CHÍNH scRNA thật: quantile của khoảng cách tới tâm gần nhất
+        z_real = z_src_d if n_src_real is None else z_src_d[:n_src_real]
+        d_real = ((z_real.unsqueeze(1) - mu_c.unsqueeze(0)).pow(2)
+                  / var_c.unsqueeze(0)).sum(dim=2) / D
+        r = torch.quantile(d_real.min(dim=1).values, pull_quantile).sqrt().clamp(min=1e-3)
 
-    # Lực 2: Direct Mahalanobis Pull (kéo điểm ST đi hẳn vào tâm cụm mu_c, không dừng ở rìa)
-    loss_pull = 0.5 * (q * maha_full).sum(dim=1)             # (N_t,)
+    # Lực 1: CE (giảm hệ số)
+    loss_ce = -(q * log_p).sum(dim=1)
 
-    loss_cluster = (w * (loss_pull + 2.0 * loss_ce)).sum() / (w.sum() + eps)
+    # Lực 2: pull dùng maha_mean, vùng chết trong bán kính r, ngoài r dùng pseudo-Huber
+    d_k = torch.sqrt(maha_mean + eps)                 # (N_t, K), cùng thang với r
+    excess = F.relu(d_k - r)
+    loss_pull = (q * _pseudo_huber(excess, r)).sum(dim=1)
 
-    return loss_cluster + radial_weight * loss_coral
+    loss_cluster = (w * (pull_weight * loss_pull + ce_weight * loss_ce)).sum() / (w.sum() + eps)
+
+    # ---- 3. Khớp phương sai nội cụm ST với scRNA (chống nén quá mức) ----
+    loss_var = z_tgt.new_zeros(())
+    if src_class_var is not None:
+        qw = q * w.unsqueeze(1)                                        # (N_t, K), không gradient
+        n_k = qw.sum(dim=0)                                            # (K,)
+        denom = n_k.clamp(min=eps).unsqueeze(1)
+        mean_k = (qw.T @ z_tgt) / denom                                # (K, D)
+        sq = (z_tgt.unsqueeze(1) - mean_k.unsqueeze(0)).pow(2)         # (N_t, K, D)
+        var_k = ((qw.unsqueeze(2) * sq).sum(dim=0) / denom).mean(dim=1)  # (K,)
+        ok = src_class_var_ok & (n_k >= var_min_n)
+        if ok.any():
+            loss_var = (torch.log(var_k[ok] + eps)
+                        - torch.log(src_class_var[ok] + eps)).pow(2).mean()
+
+    total = loss_cluster + radial_weight * loss_coral + var_weight * loss_var
+    if return_parts:
+        return total, {"var": loss_var.item(), "r": r.item(),
+                       "pull": ((w * loss_pull).sum() / (w.sum() + eps)).item()}
+    return total
 
 # =====================================================================
 # 3. GIAI ĐOẠN 1: PRETRAIN VAE & KHỞI TẠO THAM SỐ GMM
@@ -533,7 +565,8 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
                         label_to_cluster=None, truncation=2.0,
                         gmm_on_target=False,
                         align_temp=0.1, radial_weight=0.5,
-                        # --- tham số cũ giữ lại để tương thích ngược với Notebook ---
+                        warmup_epochs=10, pull_weight=1.0, ce_weight=0.5,
+                        pull_quantile=0.9, var_weight=0.5, var_ema=0.9,
                         ot_mode=None, ot_reg=None, ot_tau_s=None, ot_tau_t=None,
                         ot_iters=None, **kwargs):
     """
@@ -556,8 +589,16 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
     if label_to_cluster is not None:
         label_to_cluster = label_to_cluster.to(device)
 
+    
+    K = model.n_clusters
+    src_var = torch.zeros(K, device=device)                       # EMA phương sai lớp của scRNA
+    src_ok = torch.zeros(K, dtype=torch.bool, device=device)
+    total_warm = max(warmup_epochs * len(dataloader_rna), 1)
+    global_step = 0
+
     for epoch in range(epochs):
-        sums = {"total": 0.0, "recon": 0.0, "gmm": 0.0, "ot": 0.0, "n_aug": 0}
+        sums = {"total": 0.0, "recon": 0.0, "gmm": 0.0, "ot": 0.0, "n_aug": 0,
+                "var": 0.0, "pull": 0.0}
         n_steps = 0
 
         for x_rna, y_rna, _ in dataloader_rna:
@@ -604,13 +645,27 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
                 z_src_all = out_rna["mu"]
 
             # 4. Energy-Gated Contrastive GMM Alignment + Radial Moment Matching
-            loss_align = gmm_contrastive_alignment_loss(
+            with torch.no_grad():
+                v_b, ok_b = class_var_stats(out_rna["mu"].detach(), cluster_rna, K)
+                first, upd = ok_b & ~src_ok, ok_b & src_ok
+                src_var[first] = v_b[first]
+                src_var[upd] = var_ema * src_var[upd] + (1 - var_ema) * v_b[upd]
+                src_ok |= ok_b
+            loss_align, a_parts = gmm_contrastive_alignment_loss(
                 z_src=z_src_all,
                 z_tgt=out_spa["mu"],
                 model=model,
                 temperature=align_temp,
                 radial_weight=radial_weight,
+                n_src_real=out_rna["mu"].size(0),
+                pull_weight=pull_weight, ce_weight=ce_weight, pull_quantile=pull_quantile,
+                src_class_var=src_var, src_class_var_ok=src_ok, var_weight=var_weight,
+                return_parts=True,
             )
+
+            ramp = min(1.0, (global_step + 1) / total_warm)   # warm-up tuyến tính theo step
+            global_step += 1
+            loss_total = loss_recon + lambda_1 * loss_gmm + (lambda_2 * ramp) * loss_align
 
             loss_total = loss_recon + lambda_1 * loss_gmm + lambda_2 * loss_align
 
@@ -621,7 +676,9 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
             sums["total"] += loss_total.item()
             sums["recon"] += loss_recon.item()
             sums["gmm"] += loss_gmm.item()
-            sums["ot"] += loss_align.item()   # giữ key "ot" để Notebook đọc history không lỗi
+            sums["ot"] += loss_align.item()
+            sums["var"] += a_parts["var"]
+            sums["pull"] += a_parts["pull"]
             sums["n_aug"] += n_aug
             n_steps += 1
 
