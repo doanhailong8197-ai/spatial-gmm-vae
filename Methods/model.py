@@ -652,7 +652,8 @@ def train_joint_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer, epochs
                 src_var[upd] = var_ema * src_var[upd] + (1 - var_ema) * v_b[upd]
                 src_ok |= ok_b
             loss_align, a_parts = gmm_contrastive_alignment_loss(
-                z_src=z_src_all,
+                #z_src=z_src_all,
+                z_src=out_rna["mu"]
                 z_tgt=out_spa["mu"],
                 model=model,
                 temperature=align_temp,
