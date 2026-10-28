@@ -530,7 +530,6 @@ def pretrain_vae(model, dataloader_rna, optimizer, epochs, device, dataloader_sp
     return history
 
 
-@torch.no_grad()
 def initialize_gmm_parameters(model, dataloader_rna, n_clusters, device,
                               warmup_steps=200, lr_hbeta=1e-3, seed=0):
     """
