@@ -113,7 +113,73 @@ class Decoder(nn.Module):
         h = self.backbone(z)
         return self.out_act(self.out_layer(h))
 
+class SharedDomainDecoder(nn.Module):
+    """
+    Thân Decoder và ma trận trọng số gene dùng chung cho cả 2 miền (khóa chặt hệ tọa độ ẩn z),
+    kết hợp với hệ số khuếch đại (log_scale) và độ lệch nền (bias) riêng cho từng miền
+    để hấp thụ sai số thiết bị giữa scRNA-seq và Spatial.
+    """
+    def __init__(self, latent_dim, hidden_dims=(256, 512), output_dim=2000, dropout=0.0):
+        super().__init__()
+        layers = []
+        current_dim = latent_dim
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(current_dim, h_dim),
+                nn.LayerNorm(h_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+            current_dim = h_dim
 
+        # 1. Thân mạng và trọng số ánh xạ gene DÙNG CHUNG cho cả src và tgt
+        self.shared_backbone = nn.Sequential(*layers)
+        self.shared_gene_weight = nn.Linear(current_dim, output_dim, bias=False)
+
+        # 2. Tham số hiệu chỉnh thiết bị RIÊNG cho từng miền (chỉ 2 vector kích thước G)
+        self.log_scale_src = nn.Parameter(torch.zeros(output_dim))
+        self.bias_src = nn.Parameter(torch.full((output_dim,), -2.0))
+
+        self.log_scale_tgt = nn.Parameter(torch.zeros(output_dim))
+        self.bias_tgt = nn.Parameter(torch.full((output_dim,), -2.0))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward_domain(self, z, domain="src"):
+        h = self.shared_backbone(z)
+        gene_logits = self.shared_gene_weight(h)  # (B, G) - Biểu diễn sinh học chung
+
+        if domain == "src":
+            scale = torch.clamp(self.log_scale_src, min=-2.0, max=2.0).exp()
+            out = gene_logits * scale + self.bias_src
+        else:
+            scale = torch.clamp(self.log_scale_tgt, min=-2.0, max=2.0).exp()
+            out = gene_logits * scale + self.bias_tgt
+
+        return torch.sigmoid(out)
+
+    def reg_loss(self):
+        """Điều chuẩn nhẹ để scale của 2 miền không trôi quá xa nhau."""
+        return F.mse_loss(self.log_scale_tgt, self.log_scale_src)
+
+
+class _DomainDecoderView(nn.Module):
+    """Wrapper mỏng giúp giữ nguyên cú pháp model.decoder_src(z) và model.decoder_tgt(z)."""
+    def __init__(self, shared_decoder, domain):
+        super().__init__()
+        self.shared_decoder = shared_decoder
+        self.domain = domain
+
+    def forward(self, z):
+        return self.shared_decoder.forward_domain(z, self.domain)
+        
 class GMM_VAE(nn.Module):
     """
     GMM-VAE với mạng nhỏ h_beta dự đoán tâm (mu_c) và phương sai (var_c) 
