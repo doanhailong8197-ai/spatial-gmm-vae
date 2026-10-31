@@ -260,9 +260,15 @@ class GMM_VAE(nn.Module):
 # =====================================================================
 # 2. CÁC HÀM MẤT MÁT: RECONSTRUCTION, GMM KL & OPTIMAL TRANSPORT
 # =====================================================================
+def reconstruction_loss(x_hat, x, eps=1e-7):
+    """BCE tổng trên gene, trung bình theo tế bào (quy mô ≈ G × BCE mỗi gene)."""
+    x_hat = x_hat.clamp(eps, 1.0 - eps)          # tránh log(0)
+    return F.binary_cross_entropy(x_hat, x, reduction="sum") / x.size(0)
 
-def reconstruction_loss(x_hat, x):
-    return F.mse_loss(x_hat, x, reduction="sum") / x.size(0)
+@torch.no_grad()
+def mse_recon(x_hat, x):
+    """MSE thuần cùng quy mô cũ, chỉ để log và tính R² (không dùng để huấn luyện)."""
+    return F.mse_loss(x_hat, x, reduction="sum").item() / x.size(0)
 
 
 def gmm_kl_loss(mu, log_var, gamma, model, eps=1e-10):
@@ -550,6 +556,7 @@ def pretrain_vae(model, dataloader_rna, optimizer, epochs, device, dataloader_sp
             z = model.reparameterize(mu, log_var)
             x_hat = model.decoder_src(z)
             loss = reconstruction_loss(x_hat, x)
+            mse_rna = mse_recon(x_hat, x) 
 
             if spa_iter is not None:
                 x_spa, _, _ = next(spa_iter)
@@ -751,6 +758,7 @@ def generate_latent_augmentation(model, labels, label_to_cluster=None, truncatio
     return z_aug.detach()
 
 
+
 def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                          lambda_1, lambda_2, device,
                          label_to_cluster=None, truncation=2.0,
@@ -765,46 +773,56 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                          var_weight=0.5, var_ema=0.9,
                          gate_quantile=0.95, gate_softness=0.25,
                          repel_weight=1.0, ood_prior=0.15,
-                         lambda_cls=1.0, spread_weight=0.5):
+                         lambda_cls=1.0, spread_weight=0.5,
+                         # --- tham số báo cáo (không ảnh hưởng huấn luyện) ---
+                         total_var_rna=17.204, total_var_spa=22.754,
+                         anchor_weight=0.2):
     model.to(device)
     model.train()
     spa_iter = _infinite_loader(dataloader_spa)
     history = []
     if label_to_cluster is not None:
         label_to_cluster = label_to_cluster.to(device)
-
+ 
     K = model.n_clusters
     src_var = torch.zeros(K, device=device)
     src_ok = torch.zeros(K, dtype=torch.bool, device=device)
     steps_per_epoch = max(len(dataloader_rna), 1)
-
+ 
     phase, ep_in_phase, step_in_phase = "A", 0, 0
     total_epochs = epochs_A[1] + epochs_B[1] + epochs_C
-
+ 
+    sum_keys = ["total", "recon", "gmm", "align", "pull", "repel",
+                "var", "ood_frac", "gate", "ot_in", "acc",
+                "l_rna", "l_spa", "anchor", "mse_rna", "mse_spa"]
+ 
     for epoch in range(total_epochs):
-        sums = {k: 0.0 for k in ["total", "recon", "gmm", "align", "pull", "repel",
-                                 "var", "ood_frac", "gate", "ot_in", "acc"]}
+        sums = {k: 0.0 for k in sum_keys}
         n_steps = 0
-
+ 
         for x_rna, y_rna, _ in dataloader_rna:
             x_spa, _, _ = next(spa_iter)
             x_rna, y_rna, x_spa = x_rna.to(device), y_rna.to(device), x_spa.to(device)
-
+ 
             out_rna = model(x_rna, "src")
             out_spa = model(x_spa, "tgt")
-
-            # ---- Phần luôn có ở mọi pha: recon + GMM giám sát trên scRNA ----
+ 
+            # ---- Phần luôn có ở mọi pha: recon (BCE) + GMM giám sát trên scRNA ----
             sig_hat = model.decoder_src(out_rna["mu_c"])
-            loss_sig_anchor = reconstruction_loss(sig_hat, model.cluster_signatures)
-            loss_recon = (reconstruction_loss(out_rna["x_hat"], x_rna)
-                          + reconstruction_loss(out_spa["x_hat"], x_spa)
-                          + 0.2 * loss_sig_anchor)
-
+            loss_sig_anchor = reconstruction_loss(sig_hat, model.cluster_signatures.clamp(0, 1))
+            l_rna = reconstruction_loss(out_rna["x_hat"], x_rna)
+            l_spa = reconstruction_loss(out_spa["x_hat"], x_spa)
+            loss_recon = l_rna + l_spa + anchor_weight * loss_sig_anchor
+ 
+            # Log song song MSE (không ảnh hưởng huấn luyện)
+            mse_rna = mse_recon(out_rna["x_hat"].detach(), x_rna)
+            mse_spa = mse_recon(out_spa["x_hat"].detach(), x_spa)
+ 
             cluster_rna = label_to_cluster[y_rna] if label_to_cluster is not None else y_rna
             loss_gmm, _ = supervised_gmm_loss_and_cls(
                 out_rna["mu"], out_rna["log_var"], out_rna["z"],
                 cluster_rna, model, lambda_cls=lambda_cls)
-
+ 
             # EMA phương sai nội cụm nguồn (chuẩn bị sẵn cho pha C)
             with torch.no_grad():
                 v_b, ok_b = class_var_stats(out_rna["mu"].detach(), cluster_rna, K)
@@ -813,19 +831,19 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                 src_var[upd] = var_ema * src_var[upd] + (1 - var_ema) * v_b[upd]
                 src_ok |= ok_b
                 acc_b = (out_rna["gamma"].argmax(1) == cluster_rna).float().mean().item()
-
+ 
             loss_total = loss_recon + lambda_1 * loss_gmm
             loss_align = loss_total.new_zeros(())
             a_parts = {"var": 0., "pull": 0., "repel": 0., "ood_frac": 0., "gate": 0., "ot_in": 0.}
-
+ 
             # ---- Phần chỉ có ở pha B, C ----
             if phase in ("B", "C"):
                 ramp = min(1.0, (step_in_phase + 1) / (ramp_epochs * steps_per_epoch))
-
+ 
                 z_aug = generate_latent_augmentation(model, y_rna, label_to_cluster, truncation)
                 z_src_all = (torch.cat([out_rna["mu"], z_aug], 0) if z_aug is not None
                              else out_rna["mu"])
-
+ 
                 if phase == "B":
                     cfg = dict(force_inlier=True, repel_weight=0.0, var_weight=0.0,
                                radial_weight=radial_weight_B)
@@ -834,7 +852,7 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                     cfg = dict(force_inlier=False, repel_weight=repel_weight * ramp,
                                var_weight=var_weight * ramp, radial_weight=radial_weight_C)
                     gene_w, align_scale = 0.3, 1.0
-
+ 
                 loss_align, a_parts = gmm_contrastive_alignment_loss(
                     z_src=z_src_all, z_tgt=out_spa["mu"], model=model, x_tgt=x_spa,
                     temperature=align_temp, n_src_real=out_rna["mu"].size(0),
@@ -844,43 +862,55 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                     src_class_var=src_var, src_class_var_ok=src_ok,
                     gene_guide_weight=gene_w, ood_prior=ood_prior,
                     return_parts=True, **cfg)
-
+ 
                 # Chống co cụm ST
                 std_s = out_rna["mu"].std(0).detach()
                 std_t = out_spa["mu"].std(0)
                 loss_spread = F.relu(0.8 * std_s - std_t).pow(2).sum()
-
+ 
                 loss_total = loss_total + lambda_2 * align_scale * (loss_align + spread_weight * loss_spread)
-
+ 
             optimizer.zero_grad()
             loss_total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             step_in_phase += 1
-
-            sums["total"] += loss_total.item(); sums["recon"] += loss_recon.item()
-            sums["gmm"] += loss_gmm.item(); sums["align"] += float(loss_align)
+ 
+            sums["total"] += loss_total.item()
+            sums["recon"] += loss_recon.item()
+            sums["gmm"] += loss_gmm.item()
+            sums["align"] += float(loss_align)
             sums["acc"] += acc_b
+            sums["l_rna"] += l_rna.item()
+            sums["l_spa"] += l_spa.item()
+            sums["anchor"] += loss_sig_anchor.item()
+            sums["mse_rna"] += mse_rna
+            sums["mse_spa"] += mse_spa
             for k in ["pull", "repel", "var", "ood_frac", "gate", "ot_in"]:
                 sums[k] += a_parts[k]
             n_steps += 1
-
+ 
         stats = {k: v / max(n_steps, 1) for k, v in sums.items()}
+        stats["r2_rna"] = 1.0 - stats["mse_rna"] / total_var_rna
+        stats["r2_spa"] = 1.0 - stats["mse_spa"] / total_var_spa
         stats["phase"] = phase
         history.append(stats)
         ep_in_phase += 1
-
-        msg = (f"[{phase}] Ep {epoch+1} | total {stats['total']:.3f} | recon {stats['recon']:.3f} | "
-               f"gmm {stats['gmm']:.3f} | acc_src {stats['acc']:.1%}")
+ 
+        msg = (f"[{phase}] Ep {epoch+1} | total {stats['total']:.3f} | recon {stats['recon']:.3f} "
+               f"(rna {stats['l_rna']:.2f} spa {stats['l_spa']:.2f} anc {stats['anchor']:.2f}) | "
+               f"gmm {stats['gmm']:.3f} | acc_src {stats['acc']:.1%} | "
+               f"R2 rna/spa {stats['r2_rna']:.3f}/{stats['r2_spa']:.3f}")
         if phase != "A":
             msg += (f" | pull {stats['pull']:.3f} repel {stats['repel']:.3f} | "
                     f"gate {stats['gate']:.2f} ot_in {stats['ot_in']:.2f} est_OOD {stats['ood_frac']:.1%}")
         print(msg)
-
+ 
         # ---- Chuyển pha ----
         if phase == "A":
             if (ep_in_phase >= epochs_A[0] and stats["acc"] >= acc_stop_A) or ep_in_phase >= epochs_A[1]:
-                print("  >>", phase_diagnostics(model, dataloader_rna, dataloader_spa, device, label_to_cluster))
+                rep = phase_diagnostics(model, dataloader_rna, dataloader_spa, device, label_to_cluster)
+                print("  >>", {k: round(v, 3) for k, v in rep.items()})
                 phase, ep_in_phase, step_in_phase = "B", 0, 0
                 print("=== Chuyển sang pha B (căn chỉnh nhẹ, chưa OOD) ===")
         elif phase == "B":
@@ -891,8 +921,9 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                 print("=== Chuyển sang pha C (bật OOD + variance) ===")
         elif phase == "C" and ep_in_phase >= epochs_C:
             break
-
+ 
     return history
+ 
 # =====================================================================
 # 5. SUY LUẬN & PHÁT HIỆN OOD SAU HUẤN LUYỆN (POST-TRAINING INFERENCE)
 # =====================================================================
