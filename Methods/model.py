@@ -532,10 +532,6 @@ def gmm_contrastive_alignment_loss(
         }
     return total
 
-
-# Giữ bí danh tương thích ngược nếu có cell khác gọi tên hàm cũ
-gmm_contrastive_alignment_loss = gmm_adversarial_alignment_loss
-
 @torch.no_grad()
 def phase_diagnostics(model, dl_rna, dl_spa, device, label_to_cluster=None, n_batches=10):
     model.eval()
