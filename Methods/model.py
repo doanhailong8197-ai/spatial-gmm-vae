@@ -392,12 +392,15 @@ def gmm_adversarial_alignment_loss(
     z_src, z_tgt, model,
     x_tgt=None,
     temperature=0.1,
-    radial_weight=1.0,
+    adv_weight=1.0,          # Trọng số nhánh đối kháng Discriminator (truyền từ cfg)
+    grl_alpha=1.0,           # Cường độ đảo ngược gradient GRL (truyền từ cfg)
+    src_grl_ratio=0.1,       # Giữ miền nguồn ổn định quanh tâm cụm
+    radial_weight=1.0,       # Trọng số khớp tâm từng cụm (loss_proto)
     eps=1e-8,
     n_src_real=None,
     pull_weight=1.5,
     ce_weight=1.0,
-    pull_quantile=0.25,      # SỬA: Kéo sâu vào vùng lõi 25% của cụm thay vì dừng ở rìa 85%
+    pull_quantile=0.25,      # Kéo sâu vào vùng lõi 25% của cụm
     gate_quantile=0.95,
     gate_softness=0.35,
     src_class_var=None,
@@ -408,32 +411,37 @@ def gmm_adversarial_alignment_loss(
     repel_weight=1.0,
     ood_prior=0.15,
     force_inlier=False,
-    return_parts=False
+    return_parts=False,
+    **kwargs                 # Hứng mọi tham số phụ để không bao giờ bị lỗi TypeError
 ):
+    """
+    Hàm hợp nhất:
+    - Học đối kháng miền qua GRL (model.discriminator)
+    - Khớp tâm từng cụm (Per-Cluster Prototype Alignment) & chống sụp đổ cụm (InfoMax Diversity)
+    - Kéo sâu vào lõi cụm (pull_quantile=0.25) và đẩy OOD ở Pha C.
+    """
     D = z_tgt.size(1)
     z_src_d = z_src.detach()
     mu_c = model.mu_c.detach()   # (K, D)
     var_c = model.var_c.detach() # (K, D)
 
-    # ---- 1. Khoảng cách Mahalanobis & Logits sắc nét ----
+    # ---- 1. Khoảng cách Mahalanobis & Logits chuẩn hóa sắc nét ----
     diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)                     # (N_t, K, D)
     maha_full = (diff.pow(2) / (var_c.unsqueeze(0) + eps)).sum(dim=2) # (N_t, K)
     maha_mean = maha_full / D                                         # (N_t, K)
 
-    # Chuẩn hóa maha_mean theo trung vị mỗi hàng để Softmax luôn sắc nét dù ST còn ở xa
     scale_maha = maha_mean.detach().median(dim=1, keepdim=True).values.clamp(min=0.2)
     logits = -0.5 * (maha_mean / scale_maha) / temperature
     log_p = torch.log_softmax(logits, dim=1)
     p = log_p.exp()
 
-    # ---- 2. Giải Dustbin OT với dẫn đường biểu hiện gene ----
+    # ---- 2. Giải Dustbin OT kết hợp dẫn đường biểu hiện gene đã chuẩn hóa tâm ----
     with torch.no_grad():
         z_real = z_src_d if n_src_real is None else z_src_d[:n_src_real]
         d_real = ((z_real.unsqueeze(1) - mu_c.unsqueeze(0)).pow(2)
                   / (var_c.unsqueeze(0) + eps)).sum(dim=2) / D
         d_real_min = d_real.min(dim=1).values
 
-        # Bán kính lõi r_in nhỏ (phân vị 25%) để kéo ST vào tận tâm cụm
         r_in = torch.quantile(d_real_min, pull_quantile).sqrt().clamp(min=1e-3, max=0.45)
         d_thr = torch.quantile(d_real_min, gate_quantile).clamp(min=0.5)
         chi2_norm_thr = float(chi2_dist.ppf(0.95, df=D)) / D
@@ -441,7 +449,6 @@ def gmm_adversarial_alignment_loss(
 
         cost_latent = maha_mean / (d_thr + eps)
         if x_tgt is not None and gene_guide_weight > 0.0:
-            # Trừ trung bình từng gene trước khi tính Cosine để loại bỏ hiệu ứng nền của ST
             x_centered = x_tgt.detach() - x_tgt.detach().mean(dim=0, keepdim=True)
             sig_centered = model.cluster_signatures.detach() - model.cluster_signatures.detach().mean(dim=0, keepdim=True)
             x_norm = F.normalize(x_centered, p=2, dim=1)
@@ -471,33 +478,51 @@ def gmm_adversarial_alignment_loss(
             w_in = torch.ones_like(w_in)
             w_ood = torch.zeros_like(w_ood)
 
-    # ---- 3. Lực HÚT trực tiếp về tâm cụm mu_c cho tế bào Inlier ----
+    # ---- 3. HỌC ĐỐI KHÁNG MIỀN QUA LỚP ĐẢO NGƯỢC GRADIENT (GRL) ----
+    alpha_eff = float(grl_alpha * adv_weight)
+    z_src_rev = grad_reverse(z_src, alpha=src_grl_ratio * alpha_eff)
+    z_tgt_rev = grad_reverse(z_tgt, alpha=alpha_eff)
+
+    logits_d_src = model.discriminator(z_src_rev)
+    logits_d_tgt = model.discriminator(z_tgt_rev)
+
+    lbl_src = torch.full_like(logits_d_src, 0.05)
+    lbl_tgt = torch.full_like(logits_d_tgt, 0.95)
+
+    loss_d_src = F.binary_cross_entropy_with_logits(logits_d_src, lbl_src, reduction="mean")
+    loss_d_tgt_vec = F.binary_cross_entropy_with_logits(logits_d_tgt, lbl_tgt, reduction="none")
+    loss_d_tgt = (w_in * loss_d_tgt_vec).sum() / (w_in.sum() + eps)
+    loss_adv = 0.5 * (loss_d_src + loss_d_tgt)
+
+    with torch.no_grad():
+        acc_d_src = (logits_d_src < 0.0).float().mean()
+        acc_d_tgt = (logits_d_tgt > 0.0).float().mean()
+        disc_acc = 0.5 * (acc_d_src + acc_d_tgt).item()
+
+    # ---- 4. Lực HÚT trực tiếp về tâm cụm & Chống gộp vào Cụm 0 (loss_div) ----
     loss_ce = -(q * log_p).sum(dim=1)
     d_k = torch.sqrt(maha_mean + eps)
     excess_in = F.relu(d_k - r_in)
-    # Kết hợp lực kéo bậc 2 trực tiếp (0.5 * d_k^2) và Pseudo-Huber để không bao giờ bị mất gradient ở giữa
     loss_pull = (q * (0.5 * maha_mean + _pseudo_huber(excess_in, r_in))).sum(dim=1)
 
-    # Chống sụp đổ vào 1 cụm (Diversity / InfoMax regularization trên ST Inliers)
     p_mean = (w_in.unsqueeze(1) * p).sum(dim=0) / (w_in.sum() + eps)
     target_prior = model.pi.detach()
     loss_div = F.kl_div((p_mean + eps).log(), target_prior, reduction="sum")
 
     loss_inlier = (w_in * (pull_weight * loss_pull + ce_weight * loss_ce)).sum() / (w_in.sum() + eps) + 0.5 * loss_div
 
-    # ---- 4. Lực ĐẨY (Repulsive Margin) cho OOD ----
+    # ---- 5. Lực ĐẨY (Repulsive Margin) tách tế bào OOD ra khỏi cụm Known ----
     d_min = d_k.min(dim=1).values
     margin_violation = F.relu(r_out - d_min)
     w_ood_h = ((w_ood - 0.5) / 0.5).clamp(0.0, 1.0)
     loss_repel = (w_ood_h * margin_violation.pow(2)).sum() / float(w_ood_h.numel())
 
-    # ---- 5. Khớp Tâm Cụm Từng Lớp (Per-Cluster Prototype Alignment) & Phương sai ----
-    qw = q * w_in.unsqueeze(1)                                  # (N_t, K)
-    n_k = qw.sum(dim=0)                                         # (K,)
+    # ---- 6. Khớp Tâm Từng Cụm (loss_proto) & Phương sai nội cụm (loss_var) ----
+    qw = q * w_in.unsqueeze(1)
+    n_k = qw.sum(dim=0)
     denom = n_k.clamp(min=eps).unsqueeze(1)
-    mean_k = (qw.T @ z_tgt) / denom                             # (K, D) - Tâm thực tế của từng cụm trên ST
+    mean_k = (qw.T @ z_tgt) / denom
 
-    # Ép tâm của từng cụm trên ST (mean_k) phải trùng vào tâm mu_c của scRNA-seq
     active_k = n_k >= 2.0
     if active_k.any():
         loss_proto = F.mse_loss(mean_k[active_k], mu_c[active_k], reduction="sum") / active_k.sum().clamp(min=1)
@@ -512,14 +537,17 @@ def gmm_adversarial_alignment_loss(
         if ok.any():
             loss_var = (torch.log(var_k[ok] + eps) - torch.log(src_class_var[ok] + eps)).pow(2).mean()
 
-    total = (
+    aux_align = (
         loss_inlier
         + repel_weight * loss_repel
-        + radial_weight * loss_proto
+        + adv_weight * radial_weight * loss_proto
         + var_weight * loss_var
     )
+
     if return_parts:
-        return total, {
+        return loss_adv, aux_align, {
+            "adv": loss_adv.item(),
+            "disc_acc": disc_acc,
             "var": loss_var.item(),
             "r": r_in.item(),
             "pull": ((w_in * loss_pull).sum() / (w_in.sum() + eps)).item(),
@@ -530,7 +558,10 @@ def gmm_adversarial_alignment_loss(
             "d_thr": d_thr.item(),
             "dmin_med": min_d.median().item(),
         }
-    return total
+    return loss_adv + aux_align
+
+
+gmm_contrastive_alignment_loss = gmm_adversarial_alignment_loss
 
 @torch.no_grad()
 def phase_diagnostics(model, dl_rna, dl_spa, device, label_to_cluster=None, n_batches=10):
