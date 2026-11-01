@@ -112,17 +112,62 @@ class Decoder(nn.Module):
     def forward(self, z):
         h = self.backbone(z)
         return self.out_act(self.out_layer(h))
+class GradReverse(torch.autograd.Function):
+    """
+    Gradient Reversal Layer (Ganin et al., 2016):
+    - Chiều đi (Forward): giữ nguyên đầu vào z.
+    - Chiều về (Backward): nhân gradient truyền về Encoder với -alpha.
+      Nhờ đó, Discriminator tối thiểu hóa lỗi phân loại miền, còn Encoder
+      tối đa hóa lỗi phân loại miền (ép 2 miền chồng lấp lên nhau).
+    """
+    @staticmethod
+    def forward(ctx, x, alpha=1.0):
+        ctx.alpha = float(alpha)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
+
+
+def grad_reverse(x, alpha=1.0):
+    return GradReverse.apply(x, alpha)
+
+
+class DomainDiscriminator(nn.Module):
+    """
+    Mạng thần kinh phân biệt miền trong không gian ẩn:
+    Input: vector không gian ẩn z (B, latent_dim)
+    Output: logit dự đoán miền (0: scRNA-seq / src, 1: Spatial / tgt).
+    Sử dụng Spectral Normalization để ổn định đối kháng khi 2 miền chưa overlap.
+    """
+    def __init__(self, latent_dim, hidden_dims=(128, 64), dropout=0.1):
+        super().__init__()
+        layers = []
+        curr_dim = latent_dim
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.utils.spectral_norm(nn.Linear(curr_dim, h_dim)),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Dropout(dropout),
+            ])
+            curr_dim = h_dim
+        layers.append(nn.utils.spectral_norm(nn.Linear(curr_dim, 1)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z):
+        return self.net(z).squeeze(-1)  # (B,)
 
 
 class GMM_VAE(nn.Module):
     """
-    GMM-VAE với mạng nhỏ h_beta dự đoán tâm (mu_c) và phương sai (var_c) 
-    từ chữ ký biểu hiện gene trung bình của K loại tế bào scRNA-seq.
+    GMM-VAE tích hợp sẵn mạng phân biệt miền (self.discriminator) cho học đối kháng.
     """
     SIGMA_MIN, SIGMA_MAX = 0.1, 1.5
 
     def __init__(self, encoder, decoder_src, decoder_tgt,
-                 n_clusters, latent_dim, input_dim=None, prior_hidden_dim=256):
+                 n_clusters, latent_dim, input_dim=None, prior_hidden_dim=256,
+                 disc_hidden_dims=(128, 64)):
         super().__init__()
         self.encoder = encoder
         self.decoder_src = decoder_src
@@ -130,18 +175,13 @@ class GMM_VAE(nn.Module):
         self.n_clusters = n_clusters
         self.latent_dim = latent_dim
 
-        # Tự động lấy số chiều gene (input_dim) từ lớp Linear đầu tiên của Encoder nếu không truyền vào
         if input_dim is None:
             input_dim = encoder.backbone[0].in_features
         self.input_dim = input_dim
 
-        # Trọng số tiên nghiệm pi_c học được
         self.pi_logits = nn.Parameter(torch.zeros(n_clusters))
-
-        # Buffer lưu K vector biểu hiện gene trung bình (K, input_dim) của scRNA-seq
         self.register_buffer("cluster_signatures", torch.zeros(n_clusters, input_dim))
 
-        # Mạng nhỏ h_beta dự đoán tâm mu_c và phương sai var_c trong không gian Euclid tự do
         self.h_beta = nn.Sequential(
             nn.Linear(input_dim, prior_hidden_dim),
             nn.LayerNorm(prior_hidden_dim),
@@ -153,7 +193,11 @@ class GMM_VAE(nn.Module):
         self.mu_head = nn.Linear(prior_hidden_dim, latent_dim)
         self.sigma_head = nn.Linear(prior_hidden_dim, latent_dim)
 
-        # Khởi tạo trực giao cho mu_head để K tâm cụm ban đầu tách rời nhau
+        # Mạng phân biệt miền trong không gian ẩn
+        self.discriminator = DomainDiscriminator(
+            latent_dim=latent_dim, hidden_dims=disc_hidden_dims, dropout=0.1
+        )
+
         nn.init.orthogonal_(self.mu_head.weight, gain=2.0)
         nn.init.zeros_(self.mu_head.bias)
         nn.init.zeros_(self.sigma_head.weight)
@@ -161,15 +205,13 @@ class GMM_VAE(nn.Module):
 
     @property
     def pi(self):
-        return torch.softmax(self.pi_logits, dim=0)  # (K,)
+        return torch.softmax(self.pi_logits, dim=0)
 
     def compute_gmm_params(self):
-        """Chạy mạng h_beta một lần để lấy (mu_c, var_c) có kèm gradient cho backprop."""
         h = self.h_beta(self.cluster_signatures)
-        mu_c = self.mu_head(h)  # (K, D) - Tự do trong không gian Euclid
-        
+        mu_c = self.mu_head(h)
         min_sq, max_sq = self.SIGMA_MIN ** 2, self.SIGMA_MAX ** 2
-        var_c = min_sq + (max_sq - min_sq) * torch.sigmoid(self.sigma_head(h))  # (K, D)
+        var_c = min_sq + (max_sq - min_sq) * torch.sigmoid(self.sigma_head(h))
         return mu_c, var_c
 
     @property
@@ -188,19 +230,16 @@ class GMM_VAE(nn.Module):
         return mu + torch.randn_like(std) * std
 
     def get_log_posterior(self, z, pi=None, temperature=1.0, mu_c=None, var_c=None):
-        """
-        Tính log p(c | z) theo Công thức (16) của VaDE dùng cho hàm phạt phân loại L_sc^cls.
-        """
         if mu_c is None or var_c is None:
             mu_c, var_c = self.compute_gmm_params()
 
-        z_exp = z.unsqueeze(1)          # (B, 1, D)
-        mu_exp = mu_c.unsqueeze(0)      # (1, K, D)
-        var_exp = var_c.unsqueeze(0)    # (1, K, D)
+        z_exp = z.unsqueeze(1)
+        mu_exp = mu_c.unsqueeze(0)
+        var_exp = var_c.unsqueeze(0)
 
         log_gauss = -0.5 * (
             math.log(2 * math.pi) + torch.log(var_exp + 1e-8) + (z_exp - mu_exp).pow(2) / (var_exp + 1e-8)
-        ).sum(dim=2)  # (B, K)
+        ).sum(dim=2)
 
         if pi is None:
             pi = self.pi
@@ -211,11 +250,9 @@ class GMM_VAE(nn.Module):
         return F.log_softmax(log_joint / temperature, dim=1)
 
     def get_gamma(self, z, pi=None, temperature=1.0):
-        """Tính xác suất hậu nghiệm p(c | z) = exp(log p(c | z))."""
         return self.get_log_posterior(z, pi=pi, temperature=temperature).exp()
 
     def mahalanobis_sq(self, z):
-        """Khoảng cách Mahalanobis bình phương từ z (B, D) tới K cụm -> (B, K)."""
         mu_c, var_c = self.compute_gmm_params()
         diff = z.unsqueeze(1) - mu_c.unsqueeze(0)
         return (diff.pow(2) / (var_c.unsqueeze(0) + 1e-8)).sum(dim=2)
@@ -255,7 +292,6 @@ class GMM_VAE(nn.Module):
             "mu_c": mu_c,
             "var_c": var_c,
         }
-
 
 # =====================================================================
 # 2. CÁC HÀM MẤT MÁT: RECONSTRUCTION, GMM KL & OPTIMAL TRANSPORT
@@ -348,15 +384,17 @@ def class_var_stats(mu, y, n_clusters, min_n=3):
             ok[k] = True
     return var, ok
 
-def gmm_contrastive_alignment_loss(
+def gmm_adversarial_alignment_loss(
     z_src, z_tgt, model,
     x_tgt=None,
     temperature=0.1,
-    radial_weight=1.0,
+    adv_weight=1.0,          # Trọng số của hàm đối kháng Discriminator
+    grl_alpha=1.0,           # Cường độ đảo ngược gradient truyền về Encoder
+    src_grl_ratio=0.1,       # Tỷ lệ đảo gradient trên miền nguồn (nhỏ để giữ cố định tâm cụm src)
     eps=1e-8,
     n_src_real=None,
-    pull_weight=1.0,
-    ce_weight=0.5,
+    pull_weight=0.5,         # Giữ lực dẫn đường nhẹ về đúng tâm cụm tương ứng
+    ce_weight=0.25,
     pull_quantile=0.85,
     gate_quantile=0.95,
     gate_softness=0.25,
@@ -367,59 +405,52 @@ def gmm_contrastive_alignment_loss(
     gene_guide_weight=0.5,
     repel_weight=1.0,
     ood_prior=0.15,
-    force_inlier=False,      # MỚI: Pha B ép toàn bộ ST là inlier, chưa phân biệt Known/Unknown
-    return_parts=False
+    force_inlier=False,
+    return_parts=False,
+    **kwargs
 ):
     """
-    Hàm căn chỉnh miền nâng cấp:
-    1. Multi-modal Cost (Mahalanobis ẩn + Cosine biểu hiện gene) đưa vào Dustbin Sinkhorn OT.
-    2. Lực Hút (Pull + CE) chỉ tác động lên các mẫu Inlier (trọng số w_in).
-    3. Lực Đẩy (Repulsive Margin Loss) đẩy các mẫu OOD (trọng số w_ood) ra ngoài bán kính an toàn.
-    4. Prototype-Matched Moment Alignment: Khớp tâm của Inlier theo đúng tỷ lệ cụm
-       thực tế của ST thay vì Deep CORAL toàn cục.
-    5. force_inlier=True: bỏ qua phân biệt OOD (dùng ở pha B của huấn luyện nhiều pha).
+    Căn chỉnh miền bằng Học đối kháng (Adversarial Domain Alignment) kết hợp lọc OOD:
+    1. Domain Discriminator phân loại z_src (nhãn 0) và z_tgt (nhãn 1).
+    2. Encoder nhận gradient đảo chiều qua GRL trên các mẫu Inlier (w_in) để ép z_tgt chồng lên z_src.
+    3. Các mẫu Unknown/OOD (w_ood cao ở Pha C) được giảm trọng số đối kháng và đẩy ra ngoài bán kính r_out.
     """
     D = z_tgt.size(1)
     z_src_d = z_src.detach()
-    mu_c = model.mu_c.detach()   # (K, D)
-    var_c = model.var_c.detach() # (K, D)
+    mu_c = model.mu_c.detach()
+    var_c = model.var_c.detach()
 
-    # ---- 1. Khoảng cách Mahalanobis trung bình chiều trên không gian ẩn ----
-    diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)                     # (N_t, K, D)
-    maha_full = (diff.pow(2) / (var_c.unsqueeze(0) + eps)).sum(dim=2) # (N_t, K)
-    maha_mean = maha_full / D                                         # (N_t, K)
+    # ---- 1. Khoảng cách Mahalanobis tới K tâm cụm ----
+    diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)
+    maha_full = (diff.pow(2) / (var_c.unsqueeze(0) + eps)).sum(dim=2)
+    maha_mean = maha_full / D
 
     logits = -0.5 * maha_mean / temperature
     log_p = torch.log_softmax(logits, dim=1)
 
-    # ---- 2. Xác định bán kính cụm từ miền nguồn & Giải Dustbin OT ----
+    # ---- 2. Ước lượng cổng Inlier (w_in) / OOD (w_ood) và nhãn mềm q ----
     with torch.no_grad():
         z_real = z_src_d if n_src_real is None else z_src_d[:n_src_real]
         d_real = ((z_real.unsqueeze(1) - mu_c.unsqueeze(0)).pow(2)
                   / (var_c.unsqueeze(0) + eps)).sum(dim=2) / D
         d_real_min = d_real.min(dim=1).values
 
-        # Bán kính hút (trong cụm) và ngưỡng ranh giới OOD
         r_in = torch.quantile(d_real_min, pull_quantile).sqrt().clamp(min=1e-3)
         d_thr = torch.quantile(d_real_min, gate_quantile).clamp(min=0.5)
-        # Bán kính đẩy OOD: nằm ngoài ngưỡng chi-square chuẩn hóa theo chiều D
         chi2_norm_thr = float(chi2_dist.ppf(0.95, df=D)) / D
         r_out = max(d_thr.sqrt().item() * 1.25, math.sqrt(chi2_norm_thr))
 
-        # Kết hợp chi phí biểu hiện gene (Cosine distance) để dẫn đường khi 2 miền chưa overlap
-        cost_latent = maha_mean / (d_thr + eps)  # Chuẩn hóa về thang ~1.0 tại ranh giới cụm
+        cost_latent = maha_mean / (d_thr + eps)
         if x_tgt is not None and gene_guide_weight > 0.0:
             x_norm = F.normalize(x_tgt.detach(), p=2, dim=1)
             sig_norm = F.normalize(model.cluster_signatures.detach(), p=2, dim=1)
-            cos_sim = x_norm @ sig_norm.T                       # (N_t, K) trong [-1, 1]
-            cost_gene = 1.0 - cos_sim                           # (N_t, K) trong [0, 2]
-            # Chuẩn hóa theo median để tương thích thang đo với cost_latent
+            cos_sim = x_norm @ sig_norm.T
+            cost_gene = 1.0 - cos_sim
             cost_gene = cost_gene / (cost_gene.median().clamp(min=0.1))
             combined_cost = (1.0 - gene_guide_weight) * cost_latent + gene_guide_weight * cost_gene
         else:
             combined_cost = cost_latent
 
-        # Ngưỡng chi phí vào cột Dustbin (Unknown)
         q, w_in_ot, w_ood_ot = _sinkhorn_with_dustbin(
             combined_cost,
             dustbin_cost=1.05,
@@ -428,62 +459,74 @@ def gmm_contrastive_alignment_loss(
             cluster_prior=model.pi.detach(),
         )
 
-        # Kết hợp cổng năng lượng mượt và xác suất từ Dustbin OT
         min_d = maha_mean.min(dim=1).values
         w_gate = torch.sigmoid((d_thr - min_d) / (gate_softness * d_thr + eps))
         w_in = (0.5 * w_in_ot + 0.5 * w_gate).clamp(min=0.0, max=1.0)
         w_ood = (1.0 - w_in).clamp(min=0.0, max=1.0)
 
-        # MỚI: lưu bản w_ood thật để báo cáo est_OOD, kể cả khi ép inlier
         w_ood_raw = w_ood.clone()
-        if force_inlier:  # Pha B: chưa phân biệt Known/Unknown
+        if force_inlier:
             w_in = torch.ones_like(w_in)
             w_ood = torch.zeros_like(w_ood)
 
-    # ---- 3. Lực HÚT cho tế bào Known (Inliers) ----
+    # ---- 3. HỌC ĐỐI KHÁNG MIỀN (ADVERSARIAL DOMAIN ALIGNMENT) ----
+    # Đảo ngược gradient qua GRL: kéo mạnh z_tgt về z_src, giữ z_src ổn định quanh tâm cụm
+    alpha_eff = float(grl_alpha * adv_weight)
+    z_src_rev = grad_reverse(z_src, alpha=src_grl_ratio * alpha_eff)
+    z_tgt_rev = grad_reverse(z_tgt, alpha=alpha_eff)
+
+    logits_d_src = model.discriminator(z_src_rev)  # (N_s,)
+    logits_d_tgt = model.discriminator(z_tgt_rev)  # (N_t,)
+
+    # Label smoothing (0.05 cho src, 0.95 cho tgt) giúp gradient đối kháng luôn mượt
+    lbl_src = torch.full_like(logits_d_src, 0.05)
+    lbl_tgt = torch.full_like(logits_d_tgt, 0.95)
+
+    loss_d_src = F.binary_cross_entropy_with_logits(logits_d_src, lbl_src, reduction="mean")
+    loss_d_tgt_vec = F.binary_cross_entropy_with_logits(logits_d_tgt, lbl_tgt, reduction="none")
+
+    # Chỉ ép các tế bào Inlier (w_in) của miền đích đánh lừa Discriminator
+    loss_d_tgt = (w_in * loss_d_tgt_vec).sum() / (w_in.sum() + eps)
+    loss_adv = 0.5 * (loss_d_src + loss_d_tgt)
+
+    with torch.no_grad():
+        acc_d_src = (logits_d_src < 0.0).float().mean()
+        acc_d_tgt = (logits_d_tgt > 0.0).float().mean()
+        disc_acc = 0.5 * (acc_d_src + acc_d_tgt).item()
+
+    # ---- 4. Lực dẫn đường ngữ nghĩa cụm cho Inliers (tránh ghép nhầm cụm A sang cụm B) ----
     loss_ce = -(q * log_p).sum(dim=1)
-    d_k = torch.sqrt(maha_mean + eps)                           # (N_t, K)
+    d_k = torch.sqrt(maha_mean + eps)
     excess_in = F.relu(d_k - r_in)
     loss_pull = (q * _pseudo_huber(excess_in, r_in)).sum(dim=1)
-
     loss_inlier = (w_in * (pull_weight * loss_pull + ce_weight * loss_ce)).sum() / (w_in.sum() + eps)
 
-    # ---- 4. Lực ĐẨY (Repulsive Margin) tách tế bào Unknown (OOD) ra khỏi cụm Known ----
-    # MỚI: chỉ tính mẫu thật sự nghi OOD (w_ood > 0.5) và chia cho N_t,
-    # nên khi ít OOD thì lực đẩy tự nhỏ, không bị phóng đại.
-    d_min = d_k.min(dim=1).values                               # (N_t,)
+    # ---- 5. Lực ĐẨY (Repulsive Margin) tách tế bào Unknown (OOD) ra khỏi cụm Known ----
+    d_min = d_k.min(dim=1).values
     margin_violation = F.relu(r_out - d_min)
     w_ood_h = ((w_ood - 0.5) / 0.5).clamp(0.0, 1.0)
     loss_repel = (w_ood_h * margin_violation.pow(2)).sum() / float(w_ood_h.numel())
 
-    # ---- 5. Prototype-Conditional Moment Alignment (Thay cho Deep CORAL toàn cục) ----
-    w_in_norm = (w_in / (w_in.sum() + eps)).unsqueeze(1)        # (N_t, 1)
-    expected_tgt_anchors = q @ mu_c                             # (N_t, D) tâm mục tiêu của từng điểm ST
-    mean_tgt_inlier = (w_in_norm * z_tgt).sum(dim=0)
-    mean_anchor_inlier = (w_in_norm * expected_tgt_anchors).sum(dim=0)
-    loss_coral_inlier = F.mse_loss(mean_tgt_inlier, mean_anchor_inlier, reduction="sum")
-
-    # ---- 6. Khớp phương sai nội cụm ST với scRNA (chống nén cụm quá mức) ----
+    # ---- 6. Khớp phương sai nội cụm ST với scRNA ----
     loss_var = z_tgt.new_zeros(())
     if src_class_var is not None and var_weight > 0.0:
-        qw = q * w_in.unsqueeze(1)                              # (N_t, K)
-        n_k = qw.sum(dim=0)                                     # (K,)
+        qw = q * w_in.unsqueeze(1)
+        n_k = qw.sum(dim=0)
         denom = n_k.clamp(min=eps).unsqueeze(1)
-        mean_k = (qw.T @ z_tgt) / denom                         # (K, D)
-        sq = (z_tgt.unsqueeze(1) - mean_k.unsqueeze(0)).pow(2)  # (N_t, K, D)
+        mean_k = (qw.T @ z_tgt) / denom
+        sq = (z_tgt.unsqueeze(1) - mean_k.unsqueeze(0)).pow(2)
         var_k = ((qw.unsqueeze(2) * sq).sum(dim=0) / denom).mean(dim=1)
         ok = src_class_var_ok & (n_k >= var_min_n)
         if ok.any():
             loss_var = (torch.log(var_k[ok] + eps) - torch.log(src_class_var[ok] + eps)).pow(2).mean()
 
-    total = (
-        loss_inlier
-        + repel_weight * loss_repel
-        + radial_weight * loss_coral_inlier
-        + var_weight * loss_var
-    )
+    # Lưu ý: loss_adv không nhân thêm lambda_2 bên ngoài vì cường độ đảo ngược đã nằm trong grl_alpha
+    aux_align = loss_inlier + repel_weight * loss_repel + var_weight * loss_var
+
     if return_parts:
-        return total, {
+        return loss_adv, aux_align, {
+            "adv": loss_adv.item(),
+            "disc_acc": disc_acc,
             "var": loss_var.item(),
             "r": r_in.item(),
             "pull": ((w_in * loss_pull).sum() / (w_in.sum() + eps)).item(),
@@ -494,7 +537,11 @@ def gmm_contrastive_alignment_loss(
             "d_thr": d_thr.item(),
             "dmin_med": min_d.median().item(),
         }
-    return total
+    return loss_adv + aux_align
+
+
+# Giữ bí danh tương thích ngược nếu có cell khác gọi tên hàm cũ
+gmm_contrastive_alignment_loss = gmm_adversarial_alignment_loss
 
 @torch.no_grad()
 def phase_diagnostics(model, dl_rna, dl_spa, device, label_to_cluster=None, n_batches=10):
@@ -763,67 +810,73 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                          lambda_1, lambda_2, device,
                          label_to_cluster=None, truncation=2.0,
                          # --- cấu hình pha ---
-                         epochs_A=(10, 30), acc_stop_A=0.95,     # (min, max) epoch và ngưỡng chuyển
+                         epochs_A=(10, 30), acc_stop_A=0.95,
                          epochs_B=(10, 30), ratio_stop_B=1.5,
                          epochs_C=20,
                          ramp_epochs=5,
-                         # --- tham số alignment ---
-                         align_temp=0.1, radial_weight_B=0.2, radial_weight_C=0.5,
-                         pull_weight=1.0, ce_weight=0.5, pull_quantile=0.85,
+                         # --- tham số alignment & adversarial ---
+                         align_temp=0.1, radial_weight_B=1.0, radial_weight_C=1.0,
+                         pull_weight=0.5, ce_weight=0.25, pull_quantile=0.85,
                          var_weight=0.5, var_ema=0.9,
                          gate_quantile=0.95, gate_softness=0.25,
                          repel_weight=1.0, ood_prior=0.15,
                          lambda_cls=1.0, spread_weight=0.5,
-                         # --- tham số báo cáo (không ảnh hưởng huấn luyện) ---
+                         # --- tham số báo cáo ---
                          total_var_rna=17.204, total_var_spa=22.754,
                          anchor_weight=0.2):
     model.to(device)
     model.train()
+
+    # Đảm bảo các tham số của model.discriminator đã nằm trong optimizer
+    opt_param_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    missing_disc_params = [p for p in model.discriminator.parameters() if id(p) not in opt_param_ids]
+    if missing_disc_params:
+        optimizer.add_param_group({"params": missing_disc_params})
+
     spa_iter = _infinite_loader(dataloader_spa)
     history = []
     if label_to_cluster is not None:
         label_to_cluster = label_to_cluster.to(device)
- 
+
     K = model.n_clusters
     src_var = torch.zeros(K, device=device)
     src_ok = torch.zeros(K, dtype=torch.bool, device=device)
     steps_per_epoch = max(len(dataloader_rna), 1)
- 
+
     phase, ep_in_phase, step_in_phase = "A", 0, 0
     total_epochs = epochs_A[1] + epochs_B[1] + epochs_C
- 
-    sum_keys = ["total", "recon", "gmm", "align", "pull", "repel",
-                "var", "ood_frac", "gate", "ot_in", "acc",
+
+    sum_keys = ["total", "recon", "gmm", "align", "adv", "disc_acc",
+                "pull", "repel", "var", "ood_frac", "gate", "ot_in", "acc",
                 "l_rna", "l_spa", "anchor", "mse_rna", "mse_spa"]
- 
+
     for epoch in range(total_epochs):
         sums = {k: 0.0 for k in sum_keys}
         n_steps = 0
- 
+
         for x_rna, y_rna, _ in dataloader_rna:
             x_spa, _, _ = next(spa_iter)
             x_rna, y_rna, x_spa = x_rna.to(device), y_rna.to(device), x_spa.to(device)
- 
+
             out_rna = model(x_rna, "src")
             out_spa = model(x_spa, "tgt")
- 
-            # ---- Phần luôn có ở mọi pha: recon (BCE) + GMM giám sát trên scRNA ----
+
+            # ---- 1. Reconstruction (BCE) + GMM giám sát trên scRNA ----
             sig_hat = model.decoder_src(out_rna["mu_c"])
             loss_sig_anchor = reconstruction_loss(sig_hat, model.cluster_signatures.clamp(0, 1))
             l_rna = reconstruction_loss(out_rna["x_hat"], x_rna)
             l_spa = reconstruction_loss(out_spa["x_hat"], x_spa)
             loss_recon = l_rna + l_spa + anchor_weight * loss_sig_anchor
- 
-            # Log song song MSE (không ảnh hưởng huấn luyện)
+
             mse_rna = mse_recon(out_rna["x_hat"].detach(), x_rna)
             mse_spa = mse_recon(out_spa["x_hat"].detach(), x_spa)
- 
+
             cluster_rna = label_to_cluster[y_rna] if label_to_cluster is not None else y_rna
             loss_gmm, _ = supervised_gmm_loss_and_cls(
                 out_rna["mu"], out_rna["log_var"], out_rna["z"],
-                cluster_rna, model, lambda_cls=lambda_cls)
- 
-            # EMA phương sai nội cụm nguồn (chuẩn bị sẵn cho pha C)
+                cluster_rna, model, lambda_cls=lambda_cls
+            )
+
             with torch.no_grad():
                 v_b, ok_b = class_var_stats(out_rna["mu"].detach(), cluster_rna, K)
                 first, upd = ok_b & ~src_ok, ok_b & src_ok
@@ -831,29 +884,55 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                 src_var[upd] = var_ema * src_var[upd] + (1 - var_ema) * v_b[upd]
                 src_ok |= ok_b
                 acc_b = (out_rna["gamma"].argmax(1) == cluster_rna).float().mean().item()
- 
+
             loss_total = loss_recon + lambda_1 * loss_gmm
-            loss_align = loss_total.new_zeros(())
-            a_parts = {"var": 0., "pull": 0., "repel": 0., "ood_frac": 0., "gate": 0., "ot_in": 0.}
- 
-            # ---- Phần chỉ có ở pha B, C ----
-            if phase in ("B", "C"):
+
+            # ---- 2. Xử lý Học đối kháng theo từng Pha ----
+            if phase == "A":
+                # Ở Pha A: Discriminator học phân biệt 2 miền trước (detach để KHÔNG tác động lên Encoder)
+                logits_d_s = model.discriminator(out_rna["mu"].detach())
+                logits_d_t = model.discriminator(out_spa["mu"].detach())
+                loss_adv = 0.5 * (
+                    F.binary_cross_entropy_with_logits(logits_d_s, torch.full_like(logits_d_s, 0.05))
+                    + F.binary_cross_entropy_with_logits(logits_d_t, torch.full_like(logits_d_t, 0.95))
+                )
+                with torch.no_grad():
+                    d_acc = 0.5 * ((logits_d_s < 0.0).float().mean() + (logits_d_t > 0.0).float().mean()).item()
+
+                loss_total = loss_total + loss_adv
+                loss_align = loss_adv.detach()
+                a_parts = {"adv": loss_adv.item(), "disc_acc": d_acc,
+                           "var": 0., "pull": 0., "repel": 0., "ood_frac": 0., "gate": 0., "ot_in": 0.}
+            else:
+                # Ở Pha B và C: Bật Gradient Reversal (GRL) để Encoder đánh lừa Discriminator
                 ramp = min(1.0, (step_in_phase + 1) / (ramp_epochs * steps_per_epoch))
- 
+
                 z_aug = generate_latent_augmentation(model, y_rna, label_to_cluster, truncation)
                 z_src_all = (torch.cat([out_rna["mu"], z_aug], 0) if z_aug is not None
                              else out_rna["mu"])
- 
+
                 if phase == "B":
-                    cfg = dict(force_inlier=True, repel_weight=0.0, var_weight=0.0,
-                               radial_weight=radial_weight_B)
-                    gene_w, align_scale = 0.6, ramp
+                    align_scale = ramp
+                    cfg = dict(
+                        force_inlier=True,
+                        repel_weight=0.0,
+                        var_weight=0.0,
+                        adv_weight=radial_weight_B,
+                        grl_alpha=lambda_2 * align_scale,
+                    )
+                    gene_w = 0.6
                 else:  # phase C
-                    cfg = dict(force_inlier=False, repel_weight=repel_weight * ramp,
-                               var_weight=var_weight * ramp, radial_weight=radial_weight_C)
-                    gene_w, align_scale = 0.3, 1.0
- 
-                loss_align, a_parts = gmm_contrastive_alignment_loss(
+                    align_scale = 1.0
+                    cfg = dict(
+                        force_inlier=False,
+                        repel_weight=repel_weight * ramp,
+                        var_weight=var_weight * ramp,
+                        adv_weight=radial_weight_C,
+                        grl_alpha=lambda_2 * align_scale,
+                    )
+                    gene_w = 0.3
+
+                loss_adv, aux_align, a_parts = gmm_adversarial_alignment_loss(
                     z_src=z_src_all, z_tgt=out_spa["mu"], model=model, x_tgt=x_spa,
                     temperature=align_temp, n_src_real=out_rna["mu"].size(0),
                     pull_weight=pull_weight, ce_weight=ce_weight,
@@ -861,67 +940,70 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                     gate_softness=gate_softness,
                     src_class_var=src_var, src_class_var_ok=src_ok,
                     gene_guide_weight=gene_w, ood_prior=ood_prior,
-                    return_parts=True, **cfg)
- 
+                    return_parts=True, **cfg
+                )
+
                 # Chống co cụm ST
                 std_s = out_rna["mu"].std(0).detach()
                 std_t = out_spa["mu"].std(0)
                 loss_spread = F.relu(0.8 * std_s - std_t).pow(2).sum()
- 
-                loss_total = loss_total + lambda_2 * align_scale * (loss_align + spread_weight * loss_spread)
- 
+
+                # loss_adv cộng trực tiếp (vì hệ số lambda_2 * align_scale đã đi qua GRL cho Encoder)
+                loss_align = loss_adv + lambda_2 * align_scale * (aux_align + spread_weight * loss_spread)
+                loss_total = loss_total + loss_align
+
             optimizer.zero_grad()
             loss_total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             step_in_phase += 1
- 
+
             sums["total"] += loss_total.item()
             sums["recon"] += loss_recon.item()
             sums["gmm"] += loss_gmm.item()
-            sums["align"] += float(loss_align)
+            sums["align"] += float(loss_align.item())
             sums["acc"] += acc_b
             sums["l_rna"] += l_rna.item()
             sums["l_spa"] += l_spa.item()
             sums["anchor"] += loss_sig_anchor.item()
             sums["mse_rna"] += mse_rna
             sums["mse_spa"] += mse_spa
-            for k in ["pull", "repel", "var", "ood_frac", "gate", "ot_in"]:
+            for k in ["adv", "disc_acc", "pull", "repel", "var", "ood_frac", "gate", "ot_in"]:
                 sums[k] += a_parts[k]
             n_steps += 1
- 
+
         stats = {k: v / max(n_steps, 1) for k, v in sums.items()}
         stats["r2_rna"] = 1.0 - stats["mse_rna"] / total_var_rna
         stats["r2_spa"] = 1.0 - stats["mse_spa"] / total_var_spa
         stats["phase"] = phase
         history.append(stats)
         ep_in_phase += 1
- 
+
         msg = (f"[{phase}] Ep {epoch+1} | total {stats['total']:.3f} | recon {stats['recon']:.3f} "
                f"(rna {stats['l_rna']:.2f} spa {stats['l_spa']:.2f} anc {stats['anchor']:.2f}) | "
-               f"gmm {stats['gmm']:.3f} | acc_src {stats['acc']:.1%} | "
+               f"gmm {stats['gmm']:.3f} | acc_src {stats['acc']:.1%} | d_acc {stats['disc_acc']:.1%} | "
                f"R2 rna/spa {stats['r2_rna']:.3f}/{stats['r2_spa']:.3f}")
         if phase != "A":
-            msg += (f" | pull {stats['pull']:.3f} repel {stats['repel']:.3f} | "
+            msg += (f" | adv {stats['adv']:.3f} pull {stats['pull']:.3f} repel {stats['repel']:.3f} | "
                     f"gate {stats['gate']:.2f} ot_in {stats['ot_in']:.2f} est_OOD {stats['ood_frac']:.1%}")
         print(msg)
- 
+
         # ---- Chuyển pha ----
         if phase == "A":
             if (ep_in_phase >= epochs_A[0] and stats["acc"] >= acc_stop_A) or ep_in_phase >= epochs_A[1]:
                 rep = phase_diagnostics(model, dataloader_rna, dataloader_spa, device, label_to_cluster)
                 print("  >>", {k: round(v, 3) for k, v in rep.items()})
                 phase, ep_in_phase, step_in_phase = "B", 0, 0
-                print("=== Chuyển sang pha B (căn chỉnh nhẹ, chưa OOD) ===")
+                print("=== Chuyển sang pha B (căn chỉnh đối kháng toàn cục, chưa OOD) ===")
         elif phase == "B":
             rep = phase_diagnostics(model, dataloader_rna, dataloader_spa, device, label_to_cluster)
             print("  >>", {k: round(v, 3) for k, v in rep.items()})
             if (ep_in_phase >= epochs_B[0] and rep["ratio_tgt_thr"] <= ratio_stop_B) or ep_in_phase >= epochs_B[1]:
                 phase, ep_in_phase, step_in_phase = "C", 0, 0
-                print("=== Chuyển sang pha C (bật OOD + variance) ===")
+                print("=== Chuyển sang pha C (đối kháng có chọn lọc Inlier + đẩy OOD) ===")
         elif phase == "C" and ep_in_phase >= epochs_C:
             break
- 
+
     return history
  
 # =====================================================================
