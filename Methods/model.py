@@ -388,7 +388,7 @@ def class_var_stats(mu, y, n_clusters, min_n=3):
             ok[k] = True
     return var, ok
 
-def gmm_contrastive_alignment_loss(
+def gmm_adversarial_alignment_loss(
     z_src, z_tgt, model,
     x_tgt=None,
     temperature=0.1,
