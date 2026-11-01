@@ -387,43 +387,53 @@ def class_var_stats(mu, y, n_clusters, min_n=3):
             var[k] = m.var(dim=0, unbiased=True).mean()
             ok[k] = True
     return var, ok
+
 def gmm_adversarial_alignment_loss(
     z_src, z_tgt, model,
     x_tgt=None,
     temperature=0.1,
-    adv_weight=1.0,
-    grl_alpha=1.0,
-    src_grl_ratio=0.1,
-    radial_weight=1.0,
+    adv_weight=1.0,          # Trọng số nhánh đối kháng Discriminator (truyền từ cfg)
+    grl_alpha=1.0,           # Cường độ đảo ngược gradient GRL (truyền từ cfg)
+    src_grl_ratio=0.1,       # Giữ miền nguồn ổn định quanh tâm cụm
+    radial_weight=1.0,       # Trọng số khớp tâm từng cụm (loss_proto)
     eps=1e-8,
     n_src_real=None,
     pull_weight=1.5,
-    ce_weight=0.8,
-    pull_quantile=0.25,
-    gate_quantile=0.90,      # Siết từ 0.95 xuống 0.90 để nhạy hơn với OOD ở rìa cụm
-    gate_softness=0.25,
+    ce_weight=1.0,
+    pull_quantile=0.25,      # Kéo sâu vào vùng lõi 25% của cụm
+    gate_quantile=0.95,
+    gate_softness=0.35,
     src_class_var=None,
     src_class_var_ok=None,
     var_weight=0.5,
     var_min_n=5,
     gene_guide_weight=0.5,
-    repel_weight=1.5,
-    ood_prior=0.20,          # Dự phòng ~20% kênh Unknown
+    repel_weight=1.0,
+    ood_prior=0.15,
     force_inlier=False,
     return_parts=False,
     **kwargs
 ):
+    """
+    Bản chạy tốt ở Hình 4 & 5 kèm 2 chỉnh sửa nhỏ:
+    - SỬA 2: Dùng trung bình nhân sqrt(w_in_ot * w_gate) và giữ w_in = w_in_ot ở Pha B.
+    - SỬA 3: Bỏ loss_div để không ép phân phối cụm ST phải giống model.pi của scRNA-seq.
+    """
     D = z_tgt.size(1)
     z_src_d = z_src.detach()
-    mu_c = model.mu_c.detach()
-    var_c = model.var_c.detach()
+    mu_c = model.mu_c.detach()   # (K, D)
+    var_c = model.var_c.detach() # (K, D)
 
-    # ---- 1. Khoảng cách Mahalanobis tuyệt đối (KHÔNG chia cho median từng hàng) ----
-    diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)
-    maha_full = (diff.pow(2) / (var_c.unsqueeze(0) + eps)).sum(dim=2)
-    maha_mean = maha_full / D
+    # ---- 1. Khoảng cách Mahalanobis & Logits chuẩn hóa sắc nét (GIỮ NGUYÊN) ----
+    diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)                     # (N_t, K, D)
+    maha_full = (diff.pow(2) / (var_c.unsqueeze(0) + eps)).sum(dim=2) # (N_t, K)
+    maha_mean = maha_full / D                                         # (N_t, K)
 
-    # Dùng hằng số chuẩn hóa toàn cục từ miền nguồn để không xóa mất khoảng cách xa của OOD
+    scale_maha = maha_mean.detach().median(dim=1, keepdim=True).values.clamp(min=0.2)
+    logits = -0.5 * (maha_mean / scale_maha) / temperature
+    log_p = torch.log_softmax(logits, dim=1)
+
+    # ---- 2. Giải Dustbin OT kết hợp dẫn đường biểu hiện gene ----
     with torch.no_grad():
         z_real = z_src_d if n_src_real is None else z_src_d[:n_src_real]
         d_real = ((z_real.unsqueeze(1) - mu_c.unsqueeze(0)).pow(2)
@@ -431,65 +441,48 @@ def gmm_adversarial_alignment_loss(
         d_real_min = d_real.min(dim=1).values
 
         r_in = torch.quantile(d_real_min, pull_quantile).sqrt().clamp(min=1e-3, max=0.45)
-        d_thr = torch.quantile(d_real_min, gate_quantile).clamp(min=0.05)
+        d_thr = torch.quantile(d_real_min, gate_quantile).clamp(min=0.5)
         chi2_norm_thr = float(chi2_dist.ppf(0.95, df=D)) / D
-        r_out = max(d_thr.sqrt().item() * 1.35, math.sqrt(chi2_norm_thr) * 0.6)
+        r_out = max(d_thr.sqrt().item() * 1.25, math.sqrt(chi2_norm_thr))
 
-    logits = -0.5 * (maha_mean / d_thr.clamp(min=0.05)) / temperature
-    log_p = torch.log_softmax(logits, dim=1)
-
-    # ---- 2. Cổng Tương đồng Gene Tuyệt đối (Chốt chặn không cho hút Unknown vào cụm trống) ----
-    with torch.no_grad():
         cost_latent = maha_mean / (d_thr + eps)
-
-        if x_tgt is not None:
-            # Tính Cosine Similarity trên không gian biểu hiện gene đã trừ trung bình toàn cục
-            sig = model.cluster_signatures.detach()
-            gene_mean = sig.mean(dim=0, keepdim=True)
-            x_norm = F.normalize(x_tgt.detach() - gene_mean, p=2, dim=1)
-            sig_norm = F.normalize(sig - gene_mean, p=2, dim=1)
-            cos_sim = x_norm @ sig_norm.T                       # (N_t, K) trong [-1, 1]
-
-            # Độ tương đồng gene cao nhất của mỗi tế bào ST với K cụm Known
-            max_cos = cos_sim.max(dim=1).values                 # (N_t,)
-            # Các tế bào thuộc phân vị dưới (ood_prior) về độ tương đồng gene là ứng viên OOD mạnh
-            cos_thr = torch.quantile(max_cos, ood_prior)
-            w_gene_in = torch.sigmoid((max_cos - cos_thr) / 0.08)
-
-            # Chuẩn hóa cost_gene toàn cục (KHÔNG chia theo từng hàng để giữ nguyên cost cao của OOD)
-            cost_gene = (1.0 - cos_sim) / (1.0 - cos_thr + eps)
+        if x_tgt is not None and gene_guide_weight > 0.0:
+            x_centered = x_tgt.detach() - x_tgt.detach().mean(dim=0, keepdim=True)
+            sig_centered = model.cluster_signatures.detach() - model.cluster_signatures.detach().mean(dim=0, keepdim=True)
+            x_norm = F.normalize(x_centered, p=2, dim=1)
+            sig_norm = F.normalize(sig_centered, p=2, dim=1)
+            cos_sim = x_norm @ sig_norm.T
+            cost_gene = 1.0 - cos_sim
+            cost_gene = cost_gene / (cost_gene.median().clamp(min=0.1))
             combined_cost = (1.0 - gene_guide_weight) * cost_latent + gene_guide_weight * cost_gene
         else:
-            w_gene_in = torch.ones(z_tgt.size(0), device=z_tgt.device)
             combined_cost = cost_latent
 
-        q, w_in_ot, _ = _sinkhorn_with_dustbin(
+        q, w_in_ot, w_ood_ot = _sinkhorn_with_dustbin(
             combined_cost,
-            dustbin_cost=1.0,  # Hạ từ 1.15 xuống 1.0 để dễ đưa mẫu lạ vào kênh Unknown
+            dustbin_cost=1.15,
             reg=max(temperature, 0.06),
             ood_prior=ood_prior,
+            cluster_prior=model.pi.detach(),
         )
 
         min_d = maha_mean.min(dim=1).values
         w_gate = torch.sigmoid((d_thr - min_d) / (gate_softness * d_thr + eps))
 
-        # Tích hợp cả 3 điều kiện: Một tế bào chỉ là Inlier khi vừa khớp OT, vừa trong d_thr, vừa khớp Gene!
-        w_in = (w_in_ot * w_gate * w_gene_in).pow(1.0 / 3.0).clamp(min=0.0, max=1.0)
+        # <--- SỬA 2: Dùng trung bình nhân thay vì cộng; ở Pha B giữ w_in = w_in_ot
+        # để không kéo các mẫu đã rơi vào cột Dustbin của OT vào trong cụm Known.
+        w_in = torch.sqrt(w_in_ot * w_gate + eps).clamp(min=0.0, max=1.0)
         w_ood = (1.0 - w_in).clamp(min=0.0, max=1.0)
 
         w_ood_raw = w_ood.clone()
         if force_inlier:
-            # SỬA QUAN TRỌNG: Ngay cả ở Pha B, vẫn dùng w_gene_in để bảo vệ các tế bào Unknown
-            # không bị hút vào Cụm 0 hoặc Cụm 1!
-            w_in = w_gene_in
-            w_ood = (1.0 - w_gene_in).clamp(min=0.0, max=1.0)
+            w_in = w_in_ot
+            w_ood = torch.zeros_like(w_ood)
 
-    # ---- 3. HỌC ĐỐI KHÁNG MIỀN (Chỉ ép các mẫu có w_in cao đánh lừa Discriminator) ----
+    # ---- 3. HỌC ĐỐI KHÁNG MIỀN QUA LỚP ĐẢO NGƯỢC GRADIENT (GIỮ NGUYÊN) ----
     alpha_eff = float(grl_alpha * adv_weight)
     z_src_rev = grad_reverse(z_src, alpha=src_grl_ratio * alpha_eff)
-    # Nhân gradient đảo chiều theo từng mẫu với w_in để KHÔNG ép tế bào Unknown chồng lên scRNA-seq
-    z_tgt_inlier_mix = w_in.unsqueeze(1) * z_tgt + (1.0 - w_in.unsqueeze(1)) * z_tgt.detach()
-    z_tgt_rev = grad_reverse(z_tgt_inlier_mix, alpha=alpha_eff)
+    z_tgt_rev = grad_reverse(z_tgt, alpha=alpha_eff)
 
     logits_d_src = model.discriminator(z_src_rev)
     logits_d_tgt = model.discriminator(z_tgt_rev)
@@ -507,28 +500,28 @@ def gmm_adversarial_alignment_loss(
         acc_d_tgt = (logits_d_tgt > 0.0).float().mean()
         disc_acc = 0.5 * (acc_d_src + acc_d_tgt).item()
 
-    # ---- 4. Lực HÚT cho Inliers (ĐÃ XÓA loss_div để không bắt Unknown lấp vào cụm trống) ----
+    # ---- 4. Lực HÚT trực tiếp về tâm cụm ----
     loss_ce = -(q * log_p).sum(dim=1)
     d_k = torch.sqrt(maha_mean + eps)
     excess_in = F.relu(d_k - r_in)
     loss_pull = (q * (0.5 * maha_mean + _pseudo_huber(excess_in, r_in))).sum(dim=1)
 
+    # <--- SỬA 3: Đã bỏ "+ 0.5 * loss_div" để không bắt ST phải lấp đầy Cụm 0 và Cụm 1
     loss_inlier = (w_in * (pull_weight * loss_pull + ce_weight * loss_ce)).sum() / (w_in.sum() + eps)
 
-    # ---- 5. Lực ĐẨY (Repulsive Margin) tách tế bào Unknown ra ngoài bán kính r_out ----
+    # ---- 5. Lực ĐẨY (Repulsive Margin) tách tế bào OOD ra khỏi cụm Known ----
     d_min = d_k.min(dim=1).values
     margin_violation = F.relu(r_out - d_min)
-    # Ngưỡng kích hoạt lực đẩy nhạy hơn (w_ood > 0.35 thay vì 0.5)
-    w_ood_h = ((w_ood - 0.35) / 0.65).clamp(0.0, 1.0)
-    loss_repel = (w_ood_h * margin_violation.pow(2)).sum() / (w_ood_h.sum() + 10.0)
+    w_ood_h = ((w_ood - 0.5) / 0.5).clamp(0.0, 1.0)
+    loss_repel = (w_ood_h * margin_violation.pow(2)).sum() / float(w_ood_h.numel())
 
-    # ---- 6. Khớp Tâm Từng Cụm (Chỉ tính trên các cụm thực sự có mặt Inlier trên ST) ----
-    qw = q * (w_in.pow(2)).unsqueeze(1)  # Bình phương w_in để loại bỏ hoàn toàn ảnh hưởng của OOD lên tâm cụm
+    # ---- 6. Khớp Tâm Từng Cụm (loss_proto) & Phương sai nội cụm (loss_var) ----
+    qw = q * w_in.unsqueeze(1)
     n_k = qw.sum(dim=0)
     denom = n_k.clamp(min=eps).unsqueeze(1)
     mean_k = (qw.T @ z_tgt) / denom
 
-    active_k = n_k >= 5.0  # Chỉ kéo tâm những cụm có ít nhất 5 tế bào Inlier chắc chắn trong batch
+    active_k = n_k >= 2.0
     if active_k.any():
         loss_proto = F.mse_loss(mean_k[active_k], mu_c[active_k], reduction="sum") / active_k.sum().clamp(min=1)
     else:
@@ -564,6 +557,7 @@ def gmm_adversarial_alignment_loss(
             "dmin_med": min_d.median().item(),
         }
     return loss_adv + aux_align
+
 
 gmm_contrastive_alignment_loss = gmm_adversarial_alignment_loss
 
@@ -735,11 +729,16 @@ def initialize_gmm_parameters(model, dataloader_rna, n_clusters, device,
     }
 
 @torch.no_grad()
-def _sinkhorn_with_dustbin(cost_matrix, dustbin_cost, reg=0.08,
-                           ood_prior=0.20, cluster_prior=None, n_iters=15):
+def _sinkhorn_with_dustbin(cost_matrix, dustbin_cost, reg=0.1,
+                           ood_prior=0.15, cluster_prior=None, n_iters=25):
     """
-    Dustbin OT với col_relax nhỏ (0.15) để KHÔNG ép các tế bào Unknown
-    phải lấp đầy các cụm Known bị khuyết trên miền Spatial.
+    Giải bài toán Optimal Transport có kênh rác (Dustbin / Unknown cột K+1):
+    - cost_matrix: (N_t, K) chi phí giữa tế bào đích và K cụm Known.
+    - dustbin_cost: (N_t, 1) hoặc scalar ngưỡng chi phí để đẩy mẫu vào kênh Unknown.
+    Trả về:
+        q_known: (N_t, K) phân phối gán cụm mềm đã chuẩn hóa trên các cụm Known.
+        w_in:    (N_t,) xác suất mẫu đích thuộc tập Known (Inlier weight).
+        w_ood:   (N_t,) xác suất mẫu đích là Unknown / OOD.
     """
     N_t, K = cost_matrix.shape
     device = cost_matrix.device
@@ -749,22 +748,32 @@ def _sinkhorn_with_dustbin(cost_matrix, dustbin_cost, reg=0.08,
     else:
         dustbin_col = dustbin_cost.view(-1, 1).expand(N_t, 1)
 
+    # Ma trận chi phí mở rộng (N_t, K + 1)
     C_ext = torch.cat([cost_matrix, dustbin_col], dim=1)
+
+    # Log-kernel Boltzmann
     log_P = -C_ext / max(reg, 1e-4)
 
-    # Dùng phân phối đều trên K cụm với col_relax rất nhẹ (0.15) thay vì ép theo model.pi của scRNA
-    col_known = torch.full((K,), (1.0 - ood_prior) / K, device=device)
+    # Phân phối biên của cột: (1 - ood_prior) phân bổ cho K cụm, ood_prior cho cột Unknown
+    if cluster_prior is None:
+        col_known = torch.full((K,), (1.0 - ood_prior) / K, device=device)
+    else:
+        col_known = (cluster_prior / cluster_prior.sum().clamp(min=1e-8)) * (1.0 - ood_prior)
     col_target = torch.cat([col_known, torch.tensor([ood_prior], device=device)], dim=0)
-    log_col_target = torch.log(col_target.clamp(min=1e-8)).unsqueeze(0)
+    log_col_target = torch.log(col_target.clamp(min=1e-8)).unsqueeze(0)  # (1, K+1)
 
-    col_relax = 0.15  # SỬA QUAN TRỌNG: Nới lỏng tối đa để cụm vắng trên ST được phép rỗng
+    # <--- SỬA 1: Giảm col_relax từ 0.5 xuống 0.05 để các cụm vắng mặt trên ST
+    # (như Cụm 0, Cụm 1) được phép rỗng, không bắt cóc tế bào Unknown lấp vào.
+    col_relax = 0.05
     for _ in range(n_iters):
+        # Chuẩn hóa hàng (mỗi tế bào có tổng xác suất = 1)
         log_P = log_P - torch.logsumexp(log_P, dim=1, keepdim=True)
+        # Chuẩn hóa cột có hệ số co giãn nhẹ
         log_col_sum = torch.logsumexp(log_P, dim=0, keepdim=True) - math.log(max(N_t, 1))
         log_P = log_P + col_relax * (log_col_target - log_col_sum)
 
     log_P = log_P - torch.logsumexp(log_P, dim=1, keepdim=True)
-    P = log_P.exp()
+    P = log_P.exp()  # (N_t, K + 1)
 
     w_ood = P[:, K].clamp(min=0.0, max=1.0)
     w_in = (1.0 - w_ood).clamp(min=0.0, max=1.0)
@@ -772,6 +781,7 @@ def _sinkhorn_with_dustbin(cost_matrix, dustbin_cost, reg=0.08,
     q_known = P[:, :K]
     q_known = q_known / q_known.sum(dim=1, keepdim=True).clamp(min=1e-8)
     return q_known, w_in, w_ood
+
 
 # =====================================================================
 # 4. GIAI ĐOẠN 2: HUẤN LUYỆN ĐỒNG THỜI VỚI OPTIMAL TRANSPORT
