@@ -229,7 +229,10 @@ class GMM_VAE(nn.Module):
         std = torch.exp(0.5 * log_var)
         return mu + torch.randn_like(std) * std
 
-    def get_log_posterior(self, z, pi=None, temperature=1.0, mu_c=None, var_c=None):
+    def get_log_posterior(self, z, pi=None, temperature=1.0, mu_c=None, var_c=None, use_uniform_prior=True):
+        """
+        Dùng use_uniform_prior=True để cụm nhỏ (Endothelium) không bị nuốt bởi cụm lớn.
+        """
         if mu_c is None or var_c is None:
             mu_c, var_c = self.compute_gmm_params()
 
@@ -242,15 +245,15 @@ class GMM_VAE(nn.Module):
         ).sum(dim=2)
 
         if pi is None:
-            pi = self.pi
+            if use_uniform_prior:
+                pi = torch.full((self.n_clusters,), 1.0 / self.n_clusters, device=z.device)
+            else:
+                pi = self.pi
         if pi.dim() == 1:
             pi = pi.unsqueeze(0)
 
         log_joint = torch.log(pi + 1e-10) + log_gauss
         return F.log_softmax(log_joint / temperature, dim=1)
-
-    def get_gamma(self, z, pi=None, temperature=1.0):
-        return self.get_log_posterior(z, pi=pi, temperature=temperature).exp()
 
     def mahalanobis_sq(self, z):
         mu_c, var_c = self.compute_gmm_params()
@@ -729,16 +732,12 @@ def initialize_gmm_parameters(model, dataloader_rna, n_clusters, device,
     }
 
 @torch.no_grad()
-def _sinkhorn_with_dustbin(cost_matrix, dustbin_cost, reg=0.1,
-                           ood_prior=0.15, cluster_prior=None, n_iters=25):
+def _sinkhorn_with_dustbin(cost_matrix, dustbin_cost=0.90, reg=0.08,
+                           ood_prior=0.20, cluster_prior=None, n_iters=25):
     """
-    Giải bài toán Optimal Transport có kênh rác (Dustbin / Unknown cột K+1):
-    - cost_matrix: (N_t, K) chi phí giữa tế bào đích và K cụm Known.
-    - dustbin_cost: (N_t, 1) hoặc scalar ngưỡng chi phí để đẩy mẫu vào kênh Unknown.
-    Trả về:
-        q_known: (N_t, K) phân phối gán cụm mềm đã chuẩn hóa trên các cụm Known.
-        w_in:    (N_t,) xác suất mẫu đích thuộc tập Known (Inlier weight).
-        w_ood:   (N_t,) xác suất mẫu đích là Unknown / OOD.
+    Sinkhorn bất đối xứng (Asymmetric col_relax):
+    - K cột Known: col_relax = 0.02 (Cho phép rỗng).
+    - Cột Dustbin: col_relax = 0.85 (Ép nhận đủ ~ood_prior mẫu lạ).
     """
     N_t, K = cost_matrix.shape
     device = cost_matrix.device
@@ -748,32 +747,25 @@ def _sinkhorn_with_dustbin(cost_matrix, dustbin_cost, reg=0.1,
     else:
         dustbin_col = dustbin_cost.view(-1, 1).expand(N_t, 1)
 
-    # Ma trận chi phí mở rộng (N_t, K + 1)
     C_ext = torch.cat([cost_matrix, dustbin_col], dim=1)
-
-    # Log-kernel Boltzmann
     log_P = -C_ext / max(reg, 1e-4)
 
-    # Phân phối biên của cột: (1 - ood_prior) phân bổ cho K cụm, ood_prior cho cột Unknown
-    if cluster_prior is None:
-        col_known = torch.full((K,), (1.0 - ood_prior) / K, device=device)
-    else:
-        col_known = (cluster_prior / cluster_prior.sum().clamp(min=1e-8)) * (1.0 - ood_prior)
+    # Dùng Uniform Prior cho OT
+    col_known = torch.full((K,), (1.0 - ood_prior) / K, device=device)
     col_target = torch.cat([col_known, torch.tensor([ood_prior], device=device)], dim=0)
-    log_col_target = torch.log(col_target.clamp(min=1e-8)).unsqueeze(0)  # (1, K+1)
+    log_col_target = torch.log(col_target.clamp(min=1e-8)).unsqueeze(0)
 
-    # <--- SỬA 1: Giảm col_relax từ 0.5 xuống 0.05 để các cụm vắng mặt trên ST
-    # (như Cụm 0, Cụm 1) được phép rỗng, không bắt cóc tế bào Unknown lấp vào.
-    col_relax = 0.05
+    # Véc-tơ col_relax bất đối xứng
+    col_relax_vec = torch.full((1, K + 1), 0.02, device=device)
+    col_relax_vec[0, K] = 0.85  # Cột Dustbin ép mạnh
+
     for _ in range(n_iters):
-        # Chuẩn hóa hàng (mỗi tế bào có tổng xác suất = 1)
         log_P = log_P - torch.logsumexp(log_P, dim=1, keepdim=True)
-        # Chuẩn hóa cột có hệ số co giãn nhẹ
         log_col_sum = torch.logsumexp(log_P, dim=0, keepdim=True) - math.log(max(N_t, 1))
-        log_P = log_P + col_relax * (log_col_target - log_col_sum)
+        log_P = log_P + col_relax_vec * (log_col_target - log_col_sum)
 
     log_P = log_P - torch.logsumexp(log_P, dim=1, keepdim=True)
-    P = log_P.exp()  # (N_t, K + 1)
+    P = log_P.exp()
 
     w_ood = P[:, K].clamp(min=0.0, max=1.0)
     w_in = (1.0 - w_ood).clamp(min=0.0, max=1.0)
@@ -781,6 +773,164 @@ def _sinkhorn_with_dustbin(cost_matrix, dustbin_cost, reg=0.1,
     q_known = P[:, :K]
     q_known = q_known / q_known.sum(dim=1, keepdim=True).clamp(min=1e-8)
     return q_known, w_in, w_ood
+
+
+def gmm_adversarial_alignment_loss(
+    z_src, z_tgt, model,
+    x_tgt=None,
+    temperature=0.1,
+    adv_weight=1.0,
+    grl_alpha=1.0,
+    src_grl_ratio=0.1,
+    radial_weight=1.0,
+    eps=1e-8,
+    n_src_real=None,
+    pull_weight=1.5,
+    ce_weight=1.0,
+    pull_quantile=0.25,
+    gate_quantile=0.90,
+    gate_softness=0.30,
+    src_class_var=None,
+    src_class_var_ok=None,
+    var_weight=0.5,
+    var_min_n=5,
+    gene_guide_weight=0.5,
+    repel_weight=1.0,
+    ood_prior=0.20,
+    force_inlier=False,
+    return_parts=False,
+    **kwargs
+):
+    D = z_tgt.size(1)
+    z_src_d = z_src.detach()
+    mu_c = model.mu_c.detach()
+    var_c = model.var_c.detach()
+
+    diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)
+    maha_full = (diff.pow(2) / (var_c.unsqueeze(0) + eps)).sum(dim=2)
+    maha_mean = maha_full / D
+
+    scale_maha = maha_mean.detach().median(dim=1, keepdim=True).values.clamp(min=0.2)
+    logits = -0.5 * (maha_mean / scale_maha) / temperature
+    log_p = torch.log_softmax(logits, dim=1)
+
+    with torch.no_grad():
+        z_real = z_src_d if n_src_real is None else z_src_d[:n_src_real]
+        d_real = ((z_real.unsqueeze(1) - mu_c.unsqueeze(0)).pow(2)
+                  / (var_c.unsqueeze(0) + eps)).sum(dim=2) / D
+        d_real_min = d_real.min(dim=1).values
+
+        r_in = torch.quantile(d_real_min, pull_quantile).sqrt().clamp(min=1e-3, max=0.45)
+        d_thr = torch.quantile(d_real_min, gate_quantile).clamp(min=0.5)
+        chi2_norm_thr = float(chi2_dist.ppf(0.95, df=D)) / D
+        r_out = max(d_thr.sqrt().item() * 1.25, math.sqrt(chi2_norm_thr))
+
+        cost_latent = maha_mean / (d_thr + eps)
+        if x_tgt is not None and gene_guide_weight > 0.0:
+            x_centered = x_tgt.detach() - x_tgt.detach().mean(dim=0, keepdim=True)
+            sig_centered = model.cluster_signatures.detach() - model.cluster_signatures.detach().mean(dim=0, keepdim=True)
+            x_norm = F.normalize(x_centered, p=2, dim=1)
+            sig_norm = F.normalize(sig_centered, p=2, dim=1)
+            cos_sim = x_norm @ sig_norm.T
+            cost_gene = 1.0 - cos_sim
+            cost_gene = cost_gene / (cost_gene.median().clamp(min=0.1))
+            combined_cost = (1.0 - gene_guide_weight) * cost_latent + gene_guide_weight * cost_gene
+        else:
+            combined_cost = cost_latent
+
+        # Gọi Sinkhorn với Uniform Prior và Dustbin Cost thấp hơn (0.90)
+        q, w_in_ot, w_ood_ot = _sinkhorn_with_dustbin(
+            combined_cost,
+            dustbin_cost=0.90,
+            reg=max(temperature, 0.06),
+            ood_prior=ood_prior,
+            cluster_prior=None,
+        )
+
+        min_d = maha_mean.min(dim=1).values
+        w_gate = torch.sigmoid((d_thr - min_d) / (gate_softness * d_thr + eps))
+
+        w_in = torch.minimum(w_in_ot, w_gate).clamp(min=0.0, max=1.0)
+        w_ood = (1.0 - w_in).clamp(min=0.0, max=1.0)
+
+        w_ood_raw = w_ood.clone()
+        if force_inlier:
+            # Ở Pha B, dùng bình phương để triệt tiêu hoàn toàn trọng số của OOD (0.2^2 = 0.04)
+            w_in = w_in_ot.pow(2)
+            w_ood = torch.zeros_like(w_ood)
+
+    alpha_eff = float(grl_alpha * adv_weight)
+    z_src_rev = grad_reverse(z_src, alpha=src_grl_ratio * alpha_eff)
+    z_tgt_rev = grad_reverse(z_tgt, alpha=alpha_eff)
+
+    logits_d_src = model.discriminator(z_src_rev)
+    logits_d_tgt = model.discriminator(z_tgt_rev)
+
+    lbl_src = torch.full_like(logits_d_src, 0.05)
+    lbl_tgt = torch.full_like(logits_d_tgt, 0.95)
+
+    loss_d_src = F.binary_cross_entropy_with_logits(logits_d_src, lbl_src, reduction="mean")
+    loss_d_tgt_vec = F.binary_cross_entropy_with_logits(logits_d_tgt, lbl_tgt, reduction="none")
+    loss_d_tgt = (w_in * loss_d_tgt_vec).sum() / (w_in.sum() + eps)
+    loss_adv = 0.5 * (loss_d_src + loss_d_tgt)
+
+    with torch.no_grad():
+        acc_d_src = (logits_d_src < 0.0).float().mean()
+        acc_d_tgt = (logits_d_tgt > 0.0).float().mean()
+        disc_acc = 0.5 * (acc_d_src + acc_d_tgt).item()
+
+    loss_ce = -(q * log_p).sum(dim=1)
+    d_k = torch.sqrt(maha_mean + eps)
+    excess_in = F.relu(d_k - r_in)
+    loss_pull = (q * (0.5 * maha_mean + _pseudo_huber(excess_in, r_in))).sum(dim=1)
+    loss_inlier = (w_in * (pull_weight * loss_pull + ce_weight * loss_ce)).sum() / (w_in.sum() + eps)
+
+    d_min = d_k.min(dim=1).values
+    margin_violation = F.relu(r_out - d_min)
+    w_ood_h = ((w_ood - 0.35) / 0.65).clamp(0.0, 1.0)
+    loss_repel = (w_ood_h * margin_violation.pow(2)).sum() / float(w_ood_h.numel())
+
+    qw = q * w_in.unsqueeze(1)
+    n_k = qw.sum(dim=0)
+    denom = n_k.clamp(min=eps).unsqueeze(1)
+    mean_k = (qw.T @ z_tgt) / denom
+
+    active_k = n_k >= 3.0
+    if active_k.any():
+        loss_proto = F.mse_loss(mean_k[active_k], mu_c[active_k], reduction="sum") / active_k.sum().clamp(min=1)
+    else:
+        loss_proto = z_tgt.new_zeros(())
+
+    loss_var = z_tgt.new_zeros(())
+    if src_class_var is not None and var_weight > 0.0:
+        sq = (z_tgt.unsqueeze(1) - mean_k.unsqueeze(0)).pow(2)
+        var_k = ((qw.unsqueeze(2) * sq).sum(dim=0) / denom).mean(dim=1)
+        ok = src_class_var_ok & (n_k >= var_min_n)
+        if ok.any():
+            loss_var = (torch.log(var_k[ok] + eps) - torch.log(src_class_var[ok] + eps)).pow(2).mean()
+
+    aux_align = (
+        loss_inlier
+        + repel_weight * loss_repel
+        + adv_weight * radial_weight * loss_proto
+        + var_weight * loss_var
+    )
+
+    if return_parts:
+        return loss_adv, aux_align, {
+            "adv": loss_adv.item(),
+            "disc_acc": disc_acc,
+            "var": loss_var.item(),
+            "r": r_in.item(),
+            "pull": ((w_in * loss_pull).sum() / (w_in.sum() + eps)).item(),
+            "repel": loss_repel.item(),
+            "ood_frac": (w_ood_raw > 0.5).float().mean().item(),
+            "gate": w_gate.mean().item(),
+            "ot_in": w_in_ot.mean().item(),
+            "d_thr": d_thr.item(),
+            "dmin_med": min_d.median().item(),
+        }
+    return loss_adv + aux_align
 
 
 # =====================================================================
