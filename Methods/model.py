@@ -255,6 +255,14 @@ class GMM_VAE(nn.Module):
         log_joint = torch.log(pi + 1e-10) + log_gauss
         return F.log_softmax(log_joint / temperature, dim=1)
 
+    def get_gamma(self, z, pi=None, temperature=1.0, use_uniform_prior=True):
+        """Tính xác suất hậu nghiệm p(c | z) = exp(log p(c | z))."""
+        # Gọi lại get_log_posterior với đầy đủ tham số
+        log_post = self.get_log_posterior(
+            z, pi=pi, temperature=temperature, use_uniform_prior=use_uniform_prior
+        )
+        return log_post.exp()
+
     def mahalanobis_sq(self, z):
         mu_c, var_c = self.compute_gmm_params()
         diff = z.unsqueeze(1) - mu_c.unsqueeze(0)
