@@ -80,7 +80,7 @@ class Encoder(nn.Module):
             h = norm(h, domain) if self.norm_type == "dsbn" else norm(h)
             h = drop(act(h))
         mu = self.fc_mu(h)
-        log_var = torch.clamp(self.fc_log_var(h), min=-6.0, max=4.0)
+        log_var = torch.clamp(self.fc_log_var(h), min=-4.0, max=4.0)
         return mu, log_var
 
     @staticmethod
@@ -184,9 +184,9 @@ class DomainDiscriminator(nn.Module):
 class GMM_VAE(nn.Module):
     """
     GMM-VAE tổng quát kết hợp:
-      - Hình học Cosine bất biến thang đo + Prior GMM.
-      - Kiểm chứng sinh ngược xuyên miền (decoder_src) chống nuốt OOD.
-      - Bộ đệm hiệu chuẩn từ tập nguồn (zero target leakage).
+      - Hình học Cosine + Latent Norm bất biến thang đo + Prior GMM.
+      - Khóa kiểm chứng sinh ngược xuyên miền (decoder_src) chống nuốt OOD.
+      - Bộ đệm hiệu chuẩn hoàn toàn từ tập nguồn (zero target leakage).
     """
     SIGMA_MIN, SIGMA_MAX = 0.35, 0.75
 
@@ -208,8 +208,12 @@ class GMM_VAE(nn.Module):
         self.register_buffer("cluster_signatures", torch.zeros(n_clusters, input_dim))
         self.register_buffer("emp_mu_c", torch.zeros(n_clusters, latent_dim))
         self.register_buffer("src_is_nonneg", torch.tensor(False))
+
+        # Thống kê tập nguồn dùng làm ngưỡng dự phòng cho kịch bản Closed-Set (0% OOD)
         self.register_buffer("src_ood_q95", torch.tensor(0.50))
         self.register_buffer("src_ood_spread", torch.tensor(0.20))
+        self.register_buffer("src_ver_q95", torch.tensor(0.60))
+        self.register_buffer("src_ver_spread", torch.tensor(0.20))
 
         self.h_beta = nn.Sequential(
             nn.Linear(input_dim, prior_hidden_dim),
@@ -407,14 +411,18 @@ def _attenuation_invariant_cost(sim_matrix, top_q=0.90, min_peak=0.10):
     return 1.0 - sim_matrix / peak, peak
 
 
-def _log_attenuation_score(sim_1d, top_q=0.98, min_peak=0.10):
+def _log_attenuation_score(sim_1d, top_q=0.98, min_peak=0.10, peak_override=None):
     """
     Điểm OOD trên thang nén log bất biến suy hao:
-        s(i) = -log( clip(sim(i) / Q98(sim), 0.05, 1.20) )
+        s(i) = -log( clip(sim(i) / peak, 0.05, 1.20) )
     - Nén đuôi trái của các lớp Known marker mạnh, giãn ranh giới giữa lớp Known khó và OOD.
     - Không tạo đỉnh nhọn giả tại 0.0 (cho phép đuôi âm mượt tới -0.18).
     """
-    peak = torch.quantile(sim_1d, top_q).clamp(min=min_peak)
+    if peak_override is not None:
+        peak = peak_override if torch.is_tensor(peak_override) else sim_1d.new_tensor(float(peak_override))
+        peak = peak.clamp(min=min_peak)
+    else:
+        peak = torch.quantile(sim_1d, top_q).clamp(min=min_peak)
     rel = (sim_1d / peak).clamp(min=0.05, max=1.20)
     return -torch.log(rel), peak
 
@@ -451,11 +459,13 @@ def gmm_kl_loss(mu, log_var, gamma, model, eps=1e-10):
 
 def supervised_gmm_loss_and_cls(mu, log_var, z_sample, y_rna, model,
                                 lambda_cls=1.0, free_radius=0.50,
-                                label_smoothing=0.05, cls_temp=2.0, eps=1e-8):
+                                label_smoothing=0.05, cls_temp=2.0,
+                                min_src_std=0.18, var_floor_weight=15.0, eps=1e-8):
     """
-    Supervised GMM KL + Classification có chống sụp đổ phương sai Z_rna:
-      - free_radius=0.50: giữ phân bố nội cụm tự nhiên cho mu_src.
-      - label_smoothing=0.05 & cls_temp=2.0: ngăn NLL ép mu_src co thành hạt điểm (Ref_std -> 0.02).
+    Supervised GMM KL + Classification có sàn phương sai nội cụm chống sụp đổ Z_rna:
+      - free_radius=0.50: không ép mu_src tụ thành điểm tuyệt đối quanh mu_c.
+      - label_smoothing=0.05 & cls_temp=2.0: dịu hóa gradient phân loại.
+      - min_src_std=0.18: giữ Ref_std nội cụm tự nhiên (~0.15-0.20) thay vì co về 0.02.
     """
     valid = (y_rna >= 0) & (y_rna < model.n_clusters)
     if not valid.any():
@@ -480,7 +490,20 @@ def supervised_gmm_loss_and_cls(mu, log_var, z_sample, y_rna, model,
     log_p_c_given_z = model.get_log_posterior(z_sample, temperature=cls_temp, mu_c=mu_c, var_c=var_c)
     loss_cls = F.cross_entropy(log_p_c_given_z, y_true, label_smoothing=label_smoothing)
 
-    return loss_align + lambda_cls * loss_cls, {"align_kl": loss_align.item(), "cls_ce": loss_cls.item()}
+    # Sàn phương sai nội cụm chống sụp đổ mu_src thành hạt điểm
+    loss_var_floor = mu.new_zeros(())
+    if min_src_std > 0.0 and var_floor_weight > 0.0:
+        penalties = []
+        for k in range(model.n_clusters):
+            mk = (y_true == k)
+            if mk.sum() >= 4:
+                std_k = mu[mk].std(dim=0, unbiased=True).mean()
+                penalties.append(F.relu(min_src_std - std_k).pow(2))
+        if penalties:
+            loss_var_floor = torch.stack(penalties).mean()
+
+    total_sup = loss_align + lambda_cls * loss_cls + var_floor_weight * loss_var_floor
+    return total_sup, {"align_kl": loss_align.item(), "cls_ce": loss_cls.item()}
 
 
 def _pseudo_huber(x, delta):
@@ -543,6 +566,122 @@ def _sinkhorn_with_dustbin(cost_matrix, dustbin_cost=0.56, reg=0.08,
     return q_known, w_in, w_ood
 
 
+def _adaptive_ood_threshold(scores_np, src_q95=0.50, src_spread=0.20,
+                            ashman_min=1.6, min_weight=0.03, return_stats=False):
+    """
+    Xác định ngưỡng OOD hoàn toàn bất biến miền & không rò rỉ target:
+      1. Winsorize [p1, p99] ngăn 1-2% ngoại lai chiếm mất 1 cụm GMM.
+      2. Kiểm định hai đỉnh bằng BIC(2-GMM) < BIC(1-GMM) - 10, Ashman's D >= 1.6,
+         tỉ trọng tối thiểu >= 3% và khoảng cách hai đỉnh m1 - m0 >= max(0.20, 0.5 * src_spread).
+      3. Nếu hai đỉnh (Open-Set): dùng giao điểm đồng tiên nghiệm (Maximum-Likelihood boundary)
+         của 2-GMM(full) -> không bị kéo lệch khi tỉ lệ Known/Unknown bất cân xứng (5% hay 40% OOD).
+      4. Nếu đơn đỉnh (Closed-Set 0% Unknown): dùng ngưỡng ngoại lai vững (med + 2.5 * MAD_std).
+    """
+    vals = np.asarray(scores_np, dtype=np.float64)
+    med = float(np.median(vals))
+    mad_std = float(1.4826 * np.median(np.abs(vals - med)))
+    fallback_thr = max(med + 2.5 * mad_std, float(src_q95) * 1.25)
+
+    if len(vals) < 30 or np.std(vals) < 1e-6:
+        out = (fallback_thr, "unimodal-fallback", 0.0)
+        return (*out, {"m0": med, "m1": fallback_thr, "is_bimodal": False}) if return_stats else out
+
+    lo, hi = np.percentile(vals, 1), np.percentile(vals, 99)
+    v_fit = np.clip(vals, lo, hi).reshape(-1, 1)
+
+    gmm1 = GaussianMixture(n_components=1, covariance_type="full", reg_covar=1e-4, random_state=42).fit(v_fit)
+    gmm2 = GaussianMixture(n_components=2, covariance_type="full", reg_covar=1e-4, random_state=42, n_init=5).fit(v_fit)
+
+    bic_gain = float(gmm1.bic(v_fit) - gmm2.bic(v_fit))
+    means = gmm2.means_.ravel()
+    vars_ = np.maximum(gmm2.covariances_.ravel(), 1e-6)
+    weights = gmm2.weights_.ravel()
+
+    o = np.argsort(means)
+    m0, m1 = float(means[o[0]]), float(means[o[1]])
+    v0, v1 = float(vars_[o[0]]), float(vars_[o[1]])
+    w0, w1 = float(weights[o[0]]), float(weights[o[1]])
+    ashman_d = math.sqrt(2.0) * abs(m1 - m0) / math.sqrt(v0 + v1)
+
+    min_gap = max(0.20, 0.5 * float(src_spread))
+    if bic_gain > 10.0 and ashman_d >= ashman_min and min(w0, w1) >= min_weight and (m1 - m0) >= min_gap:
+        grid = np.linspace(m0, m1, 1000)
+        ll0 = -0.5 * (np.log(v0) + (grid - m0) ** 2 / v0)
+        ll1 = -0.5 * (np.log(v1) + (grid - m1) ** 2 / v1)
+        thr_ml = float(grid[int(np.argmin(np.abs(ll0 - ll1)))])
+        out = (thr_ml, f"2-GMM-ML (w={w0:.2f}/{w1:.2f})", float(ashman_d))
+        return (*out, {"m0": m0, "m1": m1, "w0": w0, "w1": w1, "is_bimodal": True}) if return_stats else out
+
+    out = (fallback_thr, "unimodal-fallback", float(ashman_d))
+    return (*out, {"m0": med, "m1": fallback_thr, "is_bimodal": False}) if return_stats else out
+
+
+@torch.no_grad()
+def estimate_target_verify_thresholds(model, dataset_spa, device, use_crec=False, batch_size=512):
+    """
+    Hiệu chuẩn không rò rỉ cặp ngưỡng Cổng 3 vùng (thr_in, thr_out) trên toàn bộ tập target
+    đầu mỗi epoch Pha B/C:
+      - s_ver < thr_in  -> Inlier tin cậy (kéo vào lõi cụm Known).
+      - thr_in <= s_ver <= thr_out -> Vùng đệm trung lập (không đẩy nhầm lớp Known khó như L2/3).
+      - s_ver > thr_out -> OOD tin cậy (chủ động đẩy góc trực giao + tách vỏ cầu).
+      - Nếu phân phối đơn đỉnh (Closed-Set 0% OOD) -> thr_out rất cao -> gần như không đẩy mẫu nào.
+    """
+    was_training = model.training
+    model.eval()
+
+    loader = DataLoader(dataset_spa, batch_size=batch_size, shuffle=False, drop_last=False)
+    xs, mus = [], []
+    for x, _, _ in loader:
+        x = x.to(device)
+        xs.append(x)
+        if use_crec:
+            mus.append(model.encoder(x, domain="tgt")[0])
+    X_all = torch.cat(xs, dim=0)
+
+    sim_feat = _feature_cosine_sim(
+        X_all, model.cluster_signatures, is_nonneg=bool(model.src_is_nonneg.item())
+    ).max(dim=1).values
+    s_feat, peak_feat = _log_attenuation_score(sim_feat, top_q=0.98, min_peak=0.10)
+
+    if use_crec:
+        mu_all = torch.cat(mus, dim=0)
+        x_hat_src = model.decoder_src(mu_all)
+        sim_crec = _pearson_sim(x_hat_src, X_all)
+        s_crec, peak_crec = _log_attenuation_score(sim_crec, top_q=0.98, min_peak=0.10)
+        s_ver = 0.5 * s_feat + 0.5 * s_crec
+    else:
+        peak_crec = X_all.new_tensor(0.10)
+        s_ver = s_feat
+
+    thr_ml, mode, ash_d, info = _adaptive_ood_threshold(
+        s_ver.cpu().numpy(),
+        src_q95=float(model.src_ver_q95.item()),
+        src_spread=float(model.src_ver_spread.item()),
+        return_stats=True,
+    )
+
+    if info["is_bimodal"]:
+        m0, m1 = info["m0"], info["m1"]
+        # Vùng đệm rộng bảo vệ lớp Known khó khỏi bị đẩy nhầm thành OOD
+        thr_in = thr_ml
+        thr_out = max(thr_ml + 0.14, 0.28 * m0 + 0.72 * m1)
+    else:
+        thr_in = thr_ml
+        thr_out = thr_ml * 1.25
+
+    if was_training:
+        model.train()
+
+    return {
+        "thr_in": float(thr_in),
+        "thr_out": float(thr_out),
+        "peak_feat": float(peak_feat.item()),
+        "peak_crec": float(peak_crec.item()),
+        "mode": mode,
+        "ashman_d": float(ash_d),
+    }
+
+
 def gmm_adversarial_alignment_loss(
     z_src, z_tgt, model,
     y_src=None,
@@ -566,20 +705,19 @@ def gmm_adversarial_alignment_loss(
     dustbin_cost=0.56,
     ood_prior=None,
     adaptive_ood=True,
+    verify_cfg=None,
     tgt_pi_ema=None,
     return_parts=False,
     **kwargs
 ):
     """
-    Căn chỉnh Open-Set chống vòng lặp nuốt OOD:
-      1. Gán nhãn cụm q bằng (Latent Cosine + Feature Cosine) bất biến suy hao.
-      2. Kiểm chứng Inlier/OOD BẢO THỦ: cost_ood = max(cost_lat_min, cost_verify),
-         trong đó cost_verify kết hợp Feature Cosine và Cross-Reconstruction (decoder_src) ở Pha C.
-         -> Nếu Encoder cố kéo OOD vào lõi cụm Known (cost_lat -> 0), cost_verify lập tức chặn lại!
-      3. Cổng 3 vùng (Dead-zone): chỉ hút mẫu có w_in > 0.55 và chỉ đẩy mẫu có w_ood > 0.55.
-      4. Đẩy OOD ở Pha C theo cả góc trực giao khỏi mọi cụm Known lẫn tách bán kính khỏi vỏ cầu ||mu_c||.
+    Căn chỉnh Open-Set tổng quát với Cổng 3 vùng tách biệt (Pull / Neutral / Repel):
+      - Dùng thang nén -log bất biến suy hao được hiệu chuẩn toàn cục đầu mỗi epoch (verify_cfg).
+      - Phá vỡ bẫy một chiều của max(cost_lat, cost_ver):
+          + w_in_pull chỉ mở khi s_ver < thr_in -> chặn vòng lặp nuốt OOD.
+          + w_ood_h chỉ mở khi s_ver > thr_out -> không đẩy nhầm lớp Known khó (L2/3).
+      - Sửa dứt điểm Cluster Kissing bằng r_in = 0.20 + kéo lõi trơn 0.20 * maha_mean.
     """
-    D = z_tgt.size(1)
     mu_c = model.mu_c.detach()
     var_c = model.var_c.detach()
 
@@ -590,50 +728,25 @@ def gmm_adversarial_alignment_loss(
     diff = z_tgt.unsqueeze(1) - mu_c.unsqueeze(0)                          # (N_t, K, D)
     maha_mean = (diff.pow(2) / (var_c.unsqueeze(0) + eps)).mean(dim=2)     # (N_t, K)
 
-    # ---- 2. Giải q (gán cụm) & Kiểm chứng OOD bảo thủ (AND logic cho Inlier) ----
+    # ---- 2. Gán cụm q & Cổng 3 vùng không rò rỉ (Pull / Neutral / Repel) ----
     with torch.no_grad():
         cost_latent, peak_lat = _attenuation_invariant_cost(sim_lat.detach(), top_q=0.90, min_peak=0.15)
         cost_lat_c = cost_latent.clamp(min=-0.25, max=2.0)
-        cost_lat_min = cost_lat_c.min(dim=1).values
 
-        if x_tgt is not None and gene_guide_weight > 0.0:
-            sim_feat = _feature_cosine_sim(
+        if x_tgt is not None:
+            sim_feat_mat = _feature_cosine_sim(
                 x_tgt.detach(),
                 model.cluster_signatures.detach(),
                 is_nonneg=bool(model.src_is_nonneg.item()),
                 eps=eps,
             )
-            cost_gene, _ = _attenuation_invariant_cost(sim_feat, top_q=0.90, min_peak=0.10)
+            cost_gene, _ = _attenuation_invariant_cost(sim_feat_mat, top_q=0.90, min_peak=0.10)
             cost_gene_c = cost_gene.clamp(min=-0.25, max=2.0)
-            cost_gene_min = cost_gene_c.min(dim=1).values
             assign_cost = (1.0 - gene_guide_weight) * cost_lat_c + gene_guide_weight * cost_gene_c
         else:
-            cost_gene_min = None
+            sim_feat_mat = None
             assign_cost = cost_lat_c
 
-        # Cross-Domain Reconstruction Verification qua decoder_src (không truyền gradient vào decoder_src)
-        if x_tgt is not None and use_crec_gate:
-            x_hat_src = model.decoder_src(z_tgt.detach())
-            sim_crec = _pearson_sim(x_hat_src, x_tgt.detach(), eps=eps)
-            peak_crec = torch.quantile(sim_crec, 0.90).clamp(min=0.10)
-            cost_crec = (1.0 - sim_crec / peak_crec).clamp(min=-0.25, max=2.0)
-        else:
-            cost_crec = None
-
-        # Tổng hợp chi phí kiểm chứng không gian gốc (tương thích cả ST lẫn MNIST)
-        if cost_crec is not None and cost_gene_min is not None:
-            cost_verify = 0.5 * cost_crec + 0.5 * cost_gene_min
-        elif cost_crec is not None:
-            cost_verify = cost_crec
-        elif cost_gene_min is not None:
-            cost_verify = cost_gene_min
-        else:
-            cost_verify = cost_lat_min
-
-        # Tổ hợp BẢO THỦ: chỉ cần 1 trong 2 không gian báo xa (OOD) là chặn lực hút ngay!
-        cost_ood = torch.maximum(cost_lat_min, cost_verify)
-
-        # Gán phân phối cụm q cho các mẫu
         q, _, _ = _sinkhorn_with_dustbin(
             assign_cost,
             dustbin_cost=dustbin_cost,
@@ -642,15 +755,43 @@ def gmm_adversarial_alignment_loss(
             adaptive_ood=adaptive_ood,
         )
 
-        # Trọng số Inlier / OOD trực tiếp từ chi phí bảo thủ cost_ood
-        w_in = torch.sigmoid((dustbin_cost - cost_ood) / 0.08).clamp(min=0.0, max=1.0)
-        w_ood = (1.0 - w_in).clamp(min=0.0, max=1.0)
+        # Tính điểm xác thực s_ver trên thang -log đồng nhất với verify_cfg
+        if x_tgt is not None and verify_cfg is not None and adaptive_ood:
+            sim_feat_max = sim_feat_mat.max(dim=1).values
+            s_feat_b, _ = _log_attenuation_score(
+                sim_feat_max, top_q=0.98, min_peak=0.10, peak_override=verify_cfg["peak_feat"]
+            )
+            if use_crec_gate:
+                x_hat_src = model.decoder_src(z_tgt.detach())
+                sim_crec_b = _pearson_sim(x_hat_src, x_tgt.detach(), eps=eps)
+                s_crec_b, _ = _log_attenuation_score(
+                    sim_crec_b, top_q=0.98, min_peak=0.10, peak_override=verify_cfg["peak_crec"]
+                )
+                s_ver_b = 0.5 * s_feat_b + 0.5 * s_crec_b
+            else:
+                s_ver_b = s_feat_b
 
-        # Cổng 3 vùng (Dead-zone [0.45, 0.55]): không kéo mẫu vùng biên, không đẩy nhầm mẫu Known
-        w_in_pull = ((w_in - 0.55) / 0.45).clamp(min=0.0, max=1.0)
-        w_ood_h = ((w_ood - 0.55) / 0.45).clamp(min=0.0, max=1.0)
+            thr_in = verify_cfg["thr_in"]
+            thr_out = verify_cfg["thr_out"]
 
-        lat_inlier_rate = (cost_lat_min < dustbin_cost).float().mean().item()
+            # Cổng 3 vùng tách biệt trên s_ver_b (không bị sập theo cost_lat và không kẹp bẫy Known)
+            p_in = torch.sigmoid((thr_in - s_ver_b) / 0.10)
+            p_out = torch.sigmoid((s_ver_b - thr_out) / 0.10)
+            w_in_pull = ((p_in - 0.50) / 0.50).clamp(min=0.0, max=1.0)
+            w_ood_h = ((p_out - 0.50) / 0.50).clamp(min=0.0, max=1.0)
+
+            ot_in_log = p_in.mean().item()
+            ood_frac_log = (s_ver_b > thr_out).float().mean().item()
+        else:
+            # Nhánh dự phòng khi không truyền verify_cfg hoặc adaptive_ood=False
+            cost_ood = cost_lat_c.min(dim=1).values
+            w_in = torch.sigmoid((dustbin_cost - cost_ood) / 0.08).clamp(min=0.0, max=1.0)
+            w_in_pull = ((w_in - 0.55) / 0.45).clamp(min=0.0, max=1.0)
+            w_ood_h = ((1.0 - w_in - 0.55) / 0.45).clamp(min=0.0, max=1.0)
+            ot_in_log = w_in.mean().item()
+            ood_frac_log = (w_in < 0.5).float().mean().item()
+
+        lat_inlier_rate = (cost_lat_c.min(dim=1).values < 0.50).float().mean().item()
 
     # ---- 3. Học đối kháng có trọng số chống Label Shift (IWAN) chỉ trên Inlier tin cậy ----
     alpha_eff = float(grl_alpha * adv_weight)
@@ -688,12 +829,12 @@ def gmm_adversarial_alignment_loss(
         loss_adv = z_tgt.new_zeros(())
         disc_acc = 0.5
 
-    # ---- 4. Lực HÚT chỉ trên mẫu Inlier tin cậy (w_in_pull) ----
+    # ---- 4. Lực HÚT Inlier sâu vào lõi cụm (xóa Cluster Kissing: r_in = 0.20 + 0.20 * maha) ----
     loss_ce = -(q * log_p).sum(dim=1)
-    r_in = 0.65
+    r_in = 0.20
     d_k = torch.sqrt(maha_mean + eps)
     excess_in = F.relu(d_k - r_in)
-    loss_pull = (q * _pseudo_huber(excess_in, r_in)).sum(dim=1)
+    loss_pull = (q * (0.20 * maha_mean + _pseudo_huber(excess_in, r_in))).sum(dim=1)
 
     if w_in_pull.sum() >= 1.0:
         inlier_denom = w_in_pull.sum().clamp(min=4.0)
@@ -703,13 +844,11 @@ def gmm_adversarial_alignment_loss(
         loss_inlier = z_tgt.new_zeros(())
         pull_log = 0.0
 
-    # ---- 5. Lực ĐẨY OOD chủ động (Đẩy góc trực giao khỏi mọi cụm + Tách bán kính vỏ cầu) ----
+    # ---- 5. Lực ĐẨY OOD chủ động chỉ trên OOD tin cậy (w_ood_h) ----
     if repel_weight > 0.0 and w_ood_h.sum() >= 1.0:
-        # Đẩy trực giao khỏi TẤT CẢ K cụm cùng lúc (tránh dao động giữa 2 cụm gần nhau)
         cos_margin = (0.30 * peak_lat).clamp(min=0.15, max=0.35)
         ang_violation = F.relu(sim_lat - cos_margin).pow(2).sum(dim=1)
 
-        # Kéo nhẹ chuẩn ||z_tgt|| của OOD vào vùng đệm bên trong vỏ cầu Known (||mu_c||)
         known_norm = mu_c.norm(dim=1).mean().clamp(min=1.0)
         tgt_norm = z_tgt.norm(dim=1)
         norm_violation = F.relu(tgt_norm - 0.55 * known_norm).pow(2) / (known_norm.pow(2) + eps)
@@ -754,9 +893,9 @@ def gmm_adversarial_alignment_loss(
             "r": r_in,
             "pull": pull_log,
             "repel": loss_repel.item(),
-            "ood_frac": (w_ood > 0.5).float().mean().item(),
+            "ood_frac": ood_frac_log,
             "gate": lat_inlier_rate,
-            "ot_in": w_in.mean().item(),
+            "ot_in": ot_in_log,
             "n_k": n_k.detach(),
             "in_mask": (w_in_pull > 0.2).detach(),
         }
@@ -771,7 +910,8 @@ def calibrate_source_stats(model, dataloader_rna, device, label_to_cluster=None)
     """
     Quét toàn bộ tập nguồn để chốt:
       - cluster_signatures, emp_mu_c, src_is_nonneg
-      - src_ood_q95, src_ood_spread (ngưỡng dự phòng cho trường hợp Closed-Set 0% Unknown).
+      - src_ood_q95, src_ood_spread (cùng công thức 0.45*s_lat + 0.35*s_norm + 0.20*s_crec của predict_spatial)
+      - src_ver_q95, src_ver_spread (cùng công thức 0.5*s_feat + 0.5*s_crec dùng trong huấn luyện).
     """
     was_training = model.training
     model.eval()
@@ -795,7 +935,8 @@ def calibrate_source_stats(model, dataloader_rna, device, label_to_cluster=None)
 
     K = model.n_clusters
     D = model.latent_dim
-    model.src_is_nonneg.fill_(bool((X_all.min() >= -1e-4).item()))
+    is_nonneg = bool((X_all.min() >= -1e-4).item())
+    model.src_is_nonneg.fill_(is_nonneg)
 
     emp_mu = torch.zeros(K, D, device=device)
     sigs = torch.zeros(K, model.input_dim, device=device)
@@ -808,18 +949,26 @@ def calibrate_source_stats(model, dataloader_rna, device, label_to_cluster=None)
     model.cluster_signatures.copy_(sigs)
     model.emp_mu_c.copy_(emp_mu)
 
-    # Hiệu chuẩn phân tán điểm OOD kép trên chính tập nguồn (zero target leakage)
+    # 1. Thống kê tập nguồn cho điểm OOD suy luận (0.45 s_lat + 0.35 s_norm + 0.20 s_crec)
     x_hat_all = model.decoder_src(mu_all)
     sim_lat_s = model.latent_cosine_sim(mu_all, mu_c=emp_mu).max(dim=1).values
+    norm_s = mu_all.norm(dim=1)
     sim_crec_s = _pearson_sim(x_hat_all, X_all)
-    s_lat_s, _ = _log_attenuation_score(sim_lat_s, top_q=0.98, min_peak=0.15)
-    s_crec_s, _ = _log_attenuation_score(sim_crec_s, top_q=0.98, min_peak=0.10)
-    s_src = 0.5 * s_lat_s + 0.5 * s_crec_s
+    sim_feat_s = _feature_cosine_sim(X_all, sigs, is_nonneg=is_nonneg).max(dim=1).values
 
-    q95 = torch.quantile(s_src, 0.95).clamp(min=0.15)
-    iqr = (torch.quantile(s_src, 0.75) - torch.quantile(s_src, 0.25)).clamp(min=0.05)
-    model.src_ood_q95.copy_(q95)
-    model.src_ood_spread.copy_(iqr)
+    s_lat_s, _ = _log_attenuation_score(sim_lat_s, top_q=0.98, min_peak=0.15)
+    s_norm_s, _ = _log_attenuation_score(norm_s, top_q=0.98, min_peak=0.10)
+    s_crec_s, _ = _log_attenuation_score(sim_crec_s, top_q=0.98, min_peak=0.10)
+    s_feat_s, _ = _log_attenuation_score(sim_feat_s, top_q=0.98, min_peak=0.10)
+
+    s_ood_src = 0.45 * s_lat_s + 0.35 * s_norm_s + 0.20 * s_crec_s
+    model.src_ood_q95.copy_(torch.quantile(s_ood_src, 0.95).clamp(min=0.15))
+    model.src_ood_spread.copy_((torch.quantile(s_ood_src, 0.75) - torch.quantile(s_ood_src, 0.25)).clamp(min=0.05))
+
+    # 2. Thống kê tập nguồn cho nhánh xác thực trong huấn luyện (0.5 s_feat + 0.5 s_crec)
+    s_ver_src = 0.5 * s_feat_s + 0.5 * s_crec_s
+    model.src_ver_q95.copy_(torch.quantile(s_ver_src, 0.95).clamp(min=0.15))
+    model.src_ver_spread.copy_((torch.quantile(s_ver_src, 0.75) - torch.quantile(s_ver_src, 0.25)).clamp(min=0.05))
 
     if was_training:
         model.train()
@@ -1017,18 +1166,19 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                          epochs_C=15,
                          ramp_epochs=4,
                          # --- tham số alignment & adversarial ---
-                         align_temp=0.10, radial_weight_B=1.0, radial_weight_C=1.0,
-                         pull_weight=1.2, ce_weight=1.0,
+                         align_temp=0.10, radial_weight_B=1.5, radial_weight_C=2.0,
+                         pull_weight=1.5, ce_weight=1.0,
                          var_weight=0.4, var_ema=0.9,
                          repel_weight=2.0,
-                         dustbin_cost=0.56,        # Ngưỡng bảo thủ trên thang bất biến suy hao Q90
+                         dustbin_cost=0.56,        # Chỉ dùng dự phòng khi adaptive_ood=False
                          ood_prior=None,           # Không dùng mặc định (zero target leakage)
                          adaptive_ood=True,
                          grl_weight=0.15,          # Cường độ GRL dịu (IWAN); đặt 0.0 để tắt hẳn
                          use_latent_aug=False,
-                         gene_guide_B=0.75, gene_guide_C=0.50,
+                         gene_guide_B=0.75, gene_guide_C=0.45,
                          lambda_cls=1.0, spread_weight=0.2,
                          free_radius=0.50, label_smoothing=0.05,
+                         min_src_std=0.18,
                          # --- tham số báo cáo ---
                          total_var_rna=17.204, total_var_spa=22.754,
                          anchor_weight=0.2):
@@ -1063,8 +1213,24 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
         if getattr(model.decoder_src, "use_sigmoid", False)
         else model.cluster_signatures
     )
+    verify_cfg = None
 
     for epoch in range(total_epochs):
+        # Hiệu chuẩn ngưỡng Cổng 3 vùng (thr_in, thr_out) tự thích ứng đầu mỗi epoch Pha B/C
+        if phase != "A" and adaptive_ood:
+            new_vcfg = estimate_target_verify_thresholds(
+                model, dataloader_spa.dataset, device,
+                use_crec=(phase == "C"),
+            )
+            if verify_cfg is None or ep_in_phase == 0:
+                verify_cfg = new_vcfg
+            else:
+                # Làm mượt EMA để ngưỡng không rung giữa các epoch
+                for k_ema in ("thr_in", "thr_out", "peak_feat", "peak_crec"):
+                    verify_cfg[k_ema] = 0.7 * verify_cfg[k_ema] + 0.3 * new_vcfg[k_ema]
+                verify_cfg["mode"] = new_vcfg["mode"]
+                verify_cfg["ashman_d"] = new_vcfg["ashman_d"]
+
         sums = {k: 0.0 for k in sum_keys}
         n_steps = 0
 
@@ -1090,7 +1256,7 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                 out_rna["mu"], out_rna["log_var"], out_rna["z"],
                 cluster_rna, model,
                 lambda_cls=lambda_cls, free_radius=free_radius,
-                label_smoothing=label_smoothing,
+                label_smoothing=label_smoothing, min_src_std=min_src_std,
             )
 
             with torch.no_grad():
@@ -1147,7 +1313,7 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                 else:
                     align_scale = 1.0
                     cfg = dict(
-                        use_crec_gate=True,          # Bật khóa sinh ngược decoder_src chống nuốt OOD
+                        use_crec_gate=True,
                         repel_weight=repel_weight * ramp,
                         var_weight=var_weight * ramp,
                         adv_weight=radial_weight_C,
@@ -1163,7 +1329,8 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                     src_class_var=src_var, src_class_var_ok=src_ok,
                     gene_guide_weight=gene_w, dustbin_cost=dustbin_cost,
                     ood_prior=ood_prior, adaptive_ood=adaptive_ood,
-                    tgt_pi_ema=tgt_pi_ema, return_parts=True, **cfg
+                    verify_cfg=verify_cfg, tgt_pi_ema=tgt_pi_ema,
+                    return_parts=True, **cfg
                 )
 
                 with torch.no_grad():
@@ -1174,7 +1341,6 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                         pi_t_b = pi_t_b / pi_t_b.sum()
                         tgt_pi_ema = 0.9 * tgt_pi_ema + 0.1 * pi_t_b
 
-                # Chống co cụm chỉ tính trên tập Inlier (không đối kháng với lực đẩy OOD)
                 if in_mask.sum() >= 16:
                     std_s = out_rna["mu"].std(0).detach()
                     std_t = out_spa["mu"][in_mask].std(0)
@@ -1217,8 +1383,9 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                f"gmm {stats['gmm']:.3f} | acc_src {stats['acc']:.1%} | d_acc {stats['disc_acc']:.1%} | "
                f"R2 rna/spa {stats['r2_rna']:.3f}/{stats['r2_spa']:.3f}")
         if phase != "A":
+            thr_str = f" thr[{verify_cfg['thr_in']:.2f}/{verify_cfg['thr_out']:.2f}]" if verify_cfg is not None else ""
             msg += (f" | adv {stats['adv']:.3f} pull {stats['pull']:.3f} repel {stats['repel']:.3f} | "
-                    f"lat_in {stats['gate']:.2f} ot_in {stats['ot_in']:.2f} est_OOD {stats['ood_frac']:.1%}")
+                    f"lat_in {stats['gate']:.2f} ot_in {stats['ot_in']:.2f} est_OOD {stats['ood_frac']:.1%}{thr_str}")
         print(msg)
 
         # ---- Chuyển pha ----
@@ -1230,7 +1397,8 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                 if epochs_B[1] == 0 and epochs_C == 0:
                     break
                 phase, ep_in_phase, step_in_phase = "B", 0, 0
-                print("=== Chuyển sang pha B (căn chỉnh Inlier tin cậy bằng cổng 3 vùng) ===")
+                verify_cfg = None
+                print("=== Chuyển sang pha B (căn chỉnh Inlier bằng cổng 3 vùng tự thích ứng) ===")
         elif phase == "B":
             rep = phase_diagnostics(model, dataloader_rna, dataloader_spa, device, label_to_cluster)
             print("  >>", {k: (round(v, 3) if isinstance(v, float) else v) for k, v in rep.items()})
@@ -1238,7 +1406,8 @@ def train_phased_gmm_vae(model, dataloader_rna, dataloader_spa, optimizer,
                 if epochs_C == 0:
                     break
                 phase, ep_in_phase, step_in_phase = "C", 0, 0
-                print("=== Chuyển sang pha C (khóa sinh ngược decoder_src + đẩy trực giao OOD) ===")
+                verify_cfg = None
+                print("=== Chuyển sang pha C (khóa sinh ngược decoder_src + đẩy OOD tự thích ứng) ===")
         elif phase == "C" and ep_in_phase >= epochs_C:
             break
 
@@ -1282,68 +1451,19 @@ def compute_prior(model, mu, mode="spatial", nbr=None, alpha=0.5, floor=1e-3):
     return prior / prior.sum(dim=1, keepdim=True)
 
 
-def _adaptive_ood_threshold(scores_np, src_q95=0.50, src_spread=0.20,
-                            ashman_min=1.6, min_weight=0.03):
-    """
-    Xác định ngưỡng OOD hoàn toàn bất biến miền & không rò rỉ target:
-      1. Winsorize [p1, p99] ngăn 1-2% ngoại lai chiếm mất 1 cụm GMM.
-      2. Kiểm định tính hai đỉnh bằng BIC(2-GMM) < BIC(1-GMM) - 10, Ashman's D >= 1.6,
-         tỉ trọng tối thiểu >= 3% và khoảng cách hai đỉnh m1 - m0 >= max(0.20, 0.5 * src_spread).
-      3. Nếu hai đỉnh (Open-Set): dùng giao điểm đồng tiên nghiệm (Maximum-Likelihood boundary)
-         của 2-GMM(full) -> không bị kéo lệch khi tỉ lệ Known/Unknown bất cân xứng (5% hay 40% OOD)
-         và khớp tốt khi Known trải rộng còn Unknown nhọn.
-      4. Nếu đơn đỉnh (Closed-Set 0% Unknown): dùng ngưỡng ngoại lai vững (med + 2.5 * MAD_std).
-    """
-    vals = np.asarray(scores_np, dtype=np.float64)
-    med = float(np.median(vals))
-    mad_std = float(1.4826 * np.median(np.abs(vals - med)))
-    fallback_thr = max(med + 2.5 * mad_std, float(src_q95) * 1.25)
-
-    if len(vals) < 30 or np.std(vals) < 1e-6:
-        return fallback_thr, "unimodal-fallback", 0.0
-
-    lo, hi = np.percentile(vals, 1), np.percentile(vals, 99)
-    v_fit = np.clip(vals, lo, hi).reshape(-1, 1)
-
-    gmm1 = GaussianMixture(n_components=1, covariance_type="full", reg_covar=1e-4, random_state=42).fit(v_fit)
-    gmm2 = GaussianMixture(n_components=2, covariance_type="full", reg_covar=1e-4, random_state=42, n_init=5).fit(v_fit)
-
-    bic_gain = float(gmm1.bic(v_fit) - gmm2.bic(v_fit))
-    means = gmm2.means_.ravel()
-    vars_ = np.maximum(gmm2.covariances_.ravel(), 1e-6)
-    weights = gmm2.weights_.ravel()
-
-    o = np.argsort(means)
-    m0, m1 = float(means[o[0]]), float(means[o[1]])
-    v0, v1 = float(vars_[o[0]]), float(vars_[o[1]])
-    w0, w1 = float(weights[o[0]]), float(weights[o[1]])
-    ashman_d = math.sqrt(2.0) * abs(m1 - m0) / math.sqrt(v0 + v1)
-
-    min_gap = max(0.20, 0.5 * float(src_spread))
-    if bic_gain > 10.0 and ashman_d >= ashman_min and min(w0, w1) >= min_weight and (m1 - m0) >= min_gap:
-        grid = np.linspace(m0, m1, 1000)
-        # Giao điểm ML (đồng tiên nghiệm): log p(x | Known) == log p(x | OOD)
-        ll0 = -0.5 * (np.log(v0) + (grid - m0) ** 2 / v0)
-        ll1 = -0.5 * (np.log(v1) + (grid - m1) ** 2 / v1)
-        thr_ml = float(grid[int(np.argmin(np.abs(ll0 - ll1)))])
-        return thr_ml, f"2-GMM-ML (w={w0:.2f}/{w1:.2f})", float(ashman_d)
-
-    return fallback_thr, "unimodal-fallback", float(ashman_d)
-
-
 @torch.no_grad()
 def predict_spatial(model, dataset_spa, device, nbr=None, prior_mode="spatial",
-                    alpha=0.5, feat_ood_weight=0.50, spatial_ood_alpha=0.50,
-                    use_adaptive_thr=True, batch_size=512, **kwargs):
+                    alpha=0.5, norm_ood_weight=0.35, crec_ood_weight=0.20,
+                    spatial_ood_alpha=0.50, use_adaptive_thr=True,
+                    batch_size=512, **kwargs):
     """
     Hàm suy luận & phát hiện OOD tổng quát (dùng chung cho ST lẫn MNIST):
       - Gán nhãn cụm Known bằng Spherical GMM (+ làm mịn không gian nếu nbr != None).
-      - Điểm OOD kép thuần mô hình sinh trên thang nén log (-log(sim / Q98)):
-            s_lat  : từ Latent Cosine tới tâm cụm emp_mu_c
-            s_crec : từ Cross-Domain Reconstruction Pearson qua decoder_src(mu_tgt)
-        (feat_ood_weight là trọng số của nhánh sinh ngược s_crec; mặc định 0.50).
-      - Làm mịn điểm OOD theo láng giềng không gian (chỉ khi nbr != None và prior_mode=='spatial').
-      - Tách ngưỡng tự thích ứng bằng kiểm định BIC + Ashman's D + 2-GMM(full) ML boundary.
+      - Điểm OOD tổng hợp trên thang nén log (-log / Q98):
+            s_ood = w_lat * s_lat + norm_ood_weight * s_norm + crec_ood_weight * s_crec
+        với mặc định (0.45 s_lat + 0.35 s_norm + 0.20 s_crec).
+      - Làm mịn điểm OOD theo tọa độ không gian (tự động bỏ qua khi nbr=None như MNIST).
+      - Tách ngưỡng tự thích ứng không rò rỉ bằng BIC + Ashman's D + 2-GMM(full) ML boundary.
     """
     model.to(device)
     model.eval()
@@ -1365,26 +1485,29 @@ def predict_spatial(model, dataset_spa, device, nbr=None, prior_mode="spatial",
     H = -(gamma * torch.log(gamma + 1e-10)).sum(dim=1) / math.log(model.n_clusters)
     cluster = gamma.argmax(dim=1)
 
-    # 2. Điểm OOD không gian ẩn trên thang nén log
+    # 2. Ba thành phần điểm OOD trên cùng thang nén log bất biến suy hao
     sim_lat = model.latent_cosine_sim(mu_all, mu_c=model.emp_mu_c).max(dim=1).values
     s_lat, _ = _log_attenuation_score(sim_lat, top_q=0.98, min_peak=0.15)
 
-    # 3. Điểm OOD sinh ngược xuyên miền qua decoder_src trên thang nén log
-    if feat_ood_weight > 0.0:
+    z_norm = mu_all.norm(dim=1)
+    s_norm, _ = _log_attenuation_score(z_norm, top_q=0.98, min_peak=0.10)
+
+    if crec_ood_weight > 0.0:
         x_hat_src = model.decoder_src(mu_all)
         sim_crec = _pearson_sim(x_hat_src, X_all)
         s_crec, _ = _log_attenuation_score(sim_crec, top_q=0.98, min_peak=0.10)
-        ood_score = (1.0 - feat_ood_weight) * s_lat + feat_ood_weight * s_crec
     else:
         s_crec = torch.zeros_like(s_lat)
-        ood_score = s_lat
 
-    # 4. Làm mịn điểm OOD theo tọa độ không gian (tự động bỏ qua khi nbr=None như MNIST)
+    lat_w = max(0.0, 1.0 - float(norm_ood_weight) - float(crec_ood_weight))
+    ood_score = lat_w * s_lat + float(norm_ood_weight) * s_norm + float(crec_ood_weight) * s_crec
+
+    # 3. Làm mịn điểm OOD theo tọa độ không gian (tự động bỏ qua khi nbr=None)
     if nbr is not None and effective_mode == "spatial" and spatial_ood_alpha > 0.0:
         nbr_dev = nbr.to(device)
         ood_score = (1.0 - spatial_ood_alpha) * ood_score + spatial_ood_alpha * ood_score[nbr_dev].mean(dim=1)
 
-    # 5. Xác định ngưỡng OOD tự thích ứng không rò rỉ
+    # 4. Xác định ngưỡng OOD tự thích ứng không rò rỉ
     ood_np = ood_score.cpu().numpy()
     if use_adaptive_thr:
         ood_thr, thr_mode, ashman_d = _adaptive_ood_threshold(
@@ -1411,6 +1534,7 @@ def predict_spatial(model, dataset_spa, device, nbr=None, prior_mode="spatial",
         "entropy": H,
         "ood_score": ood_score,
         "s_lat": s_lat,
+        "s_norm": s_norm,
         "s_crec": s_crec,
         "ood_thr": ood_thr,
         "accept": accept,
