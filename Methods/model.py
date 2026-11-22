@@ -619,12 +619,11 @@ def _adaptive_ood_threshold(scores_np, src_q95=0.50, src_spread=0.20,
 @torch.no_grad()
 def estimate_target_verify_thresholds(model, dataset_spa, device, use_crec=False, batch_size=512):
     """
-    Hiệu chuẩn không rò rỉ cặp ngưỡng Cổng 3 vùng (thr_in, thr_out) trên toàn bộ tập target
-    đầu mỗi epoch Pha B/C:
-      - s_ver < thr_in  -> Inlier tin cậy (kéo vào lõi cụm Known).
-      - thr_in <= s_ver <= thr_out -> Vùng đệm trung lập (không đẩy nhầm lớp Known khó như L2/3).
-      - s_ver > thr_out -> OOD tin cậy (chủ động đẩy góc trực giao + tách vỏ cầu).
-      - Nếu phân phối đơn đỉnh (Closed-Set 0% OOD) -> thr_out rất cao -> gần như không đẩy mẫu nào.
+    Hiệu chuẩn không rò rỉ cặp ngưỡng Cổng 3 vùng ĐỐI XỨNG (thr_in < thr_ml < thr_out):
+      - s_ver < thr_in  -> Inlier tin cậy (kéo sâu vào lõi cụm Known).
+      - thr_in <= s_ver <= thr_out -> Vùng đệm trung lập (chặn hút nhầm Unknown lẫn biên,
+        đồng thời không đẩy nhầm lớp Known khó như L2/3).
+      - s_ver > thr_out -> OOD tin cậy (đẩy trực giao + tách vỏ cầu).
     """
     was_training = model.training
     model.eval()
@@ -648,7 +647,8 @@ def estimate_target_verify_thresholds(model, dataset_spa, device, use_crec=False
         x_hat_src = model.decoder_src(mu_all)
         sim_crec = _pearson_sim(x_hat_src, X_all)
         s_crec, peak_crec = _log_attenuation_score(sim_crec, top_q=0.98, min_peak=0.10)
-        s_ver = 0.5 * s_feat + 0.5 * s_crec
+        # Giữ mỏ neo s_feat (0.65) để chống trôi ngưỡng ngược theo Encoder ở Pha C
+        s_ver = 0.65 * s_feat + 0.35 * s_crec
     else:
         peak_crec = X_all.new_tensor(0.10)
         s_ver = s_feat
@@ -662,9 +662,10 @@ def estimate_target_verify_thresholds(model, dataset_spa, device, use_crec=False
 
     if info["is_bimodal"]:
         m0, m1 = info["m0"], info["m1"]
-        # Vùng đệm rộng bảo vệ lớp Known khó khỏi bị đẩy nhầm thành OOD
-        thr_in = thr_ml
-        thr_out = max(thr_ml + 0.14, 0.28 * m0 + 0.72 * m1)
+        gap = max(m1 - m0, 0.15)
+        # Cổng 3 vùng đối xứng quanh thr_ml: chặn hút nhầm Unknown vùng biên & không đẩy quá muộn
+        thr_in = thr_ml - 0.12 * gap
+        thr_out = thr_ml + 0.08 * gap
     else:
         thr_in = thr_ml
         thr_out = thr_ml * 1.25
