@@ -712,12 +712,14 @@ def gmm_adversarial_alignment_loss(
     **kwargs
 ):
     """
-    Căn chỉnh Open-Set tổng quát với Cổng 3 vùng tách biệt (Pull / Neutral / Repel):
-      - Dùng thang nén -log bất biến suy hao được hiệu chuẩn toàn cục đầu mỗi epoch (verify_cfg).
-      - Phá vỡ bẫy một chiều của max(cost_lat, cost_ver):
-          + w_in_pull chỉ mở khi s_ver < thr_in -> chặn vòng lặp nuốt OOD.
-          + w_ood_h chỉ mở khi s_ver > thr_out -> không đẩy nhầm lớp Known khó (L2/3).
-      - Sửa dứt điểm Cluster Kissing bằng r_in = 0.20 + kéo lõi trơn 0.20 * maha_mean.
+    Căn chỉnh Open-Set tổng quát với Cổng 3 vùng đối xứng (Pull / Neutral / Repel):
+      - Dùng thang nén -log bất biến suy hao với mỏ neo s_feat (0.65) + s_crec (0.35)
+        được hiệu chuẩn toàn cục đầu mỗi epoch (verify_cfg).
+      - Cổng 3 vùng tách biệt:
+          + s_ver < thr_in              -> w_in_pull > 0 (kéo sâu vào lõi cụm Known)
+          + thr_in <= s_ver <= thr_out  -> vùng đệm trung lập (w_in_pull = 0, w_ood_h = 0)
+          + s_ver > thr_out             -> w_ood_h > 0 (đẩy trực giao + tách vỏ cầu OOD)
+      - Sửa Cluster Kissing bằng r_in = 0.20 + lực kéo lõi trơn 0.20 * maha_mean.
     """
     mu_c = model.mu_c.detach()
     var_c = model.var_c.detach()
@@ -756,7 +758,7 @@ def gmm_adversarial_alignment_loss(
             adaptive_ood=adaptive_ood,
         )
 
-        # Tính điểm xác thực s_ver trên thang -log đồng nhất với verify_cfg
+        # Tính điểm xác thực s_ver trên thang -log đồng nhất với estimate_target_verify_thresholds
         if x_tgt is not None and verify_cfg is not None and adaptive_ood:
             sim_feat_max = sim_feat_mat.max(dim=1).values
             s_feat_b, _ = _log_attenuation_score(
@@ -768,14 +770,15 @@ def gmm_adversarial_alignment_loss(
                 s_crec_b, _ = _log_attenuation_score(
                     sim_crec_b, top_q=0.98, min_peak=0.10, peak_override=verify_cfg["peak_crec"]
                 )
-                s_ver_b = 0.5 * s_feat_b + 0.5 * s_crec_b
+                # Giữ mỏ neo s_feat (0.65) + s_crec (0.35) chống trôi ngưỡng ở Pha C
+                s_ver_b = 0.65 * s_feat_b + 0.35 * s_crec_b
             else:
                 s_ver_b = s_feat_b
 
             thr_in = verify_cfg["thr_in"]
             thr_out = verify_cfg["thr_out"]
 
-            # Cổng 3 vùng tách biệt trên s_ver_b (không bị sập theo cost_lat và không kẹp bẫy Known)
+            # Cổng 3 vùng đối xứng quanh thr_ml: chặn hút nhầm Unknown biên & bảo vệ Known khó
             p_in = torch.sigmoid((thr_in - s_ver_b) / 0.10)
             p_out = torch.sigmoid((s_ver_b - thr_out) / 0.10)
             w_in_pull = ((p_in - 0.50) / 0.50).clamp(min=0.0, max=1.0)
