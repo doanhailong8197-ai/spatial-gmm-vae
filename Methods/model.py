@@ -1456,23 +1456,28 @@ def compute_prior(model, mu, mode="spatial", nbr=None, alpha=0.5, floor=1e-3):
 
 
 @torch.no_grad()
-def predict_spatial(model, dataset_spa, device, nbr=None, prior_mode="spatial",
-                    alpha=0.5, norm_ood_weight=0.35, crec_ood_weight=0.20,
-                    spatial_ood_alpha=0.50, use_adaptive_thr=True,
-                    batch_size=512, **kwargs):
+def extract_mu(model, dataset, device, batch_size=512, domain="tgt"):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+    model.eval()
+    return torch.cat([model.encoder(x.to(device), domain=domain)[0] for x, _, _ in loader], dim=0)
+
+
+@torch.no_grad()
+def predict_target(model, dataset_tgt, device,
+                   norm_ood_weight=0.35, crec_ood_weight=0.20,
+                   use_adaptive_thr=True, batch_size=512, **kwargs):
     """
-    Hàm suy luận & phát hiện OOD tổng quát (dùng chung cho ST lẫn MNIST):
-      - Gán nhãn cụm Known bằng Spherical GMM (+ làm mịn không gian nếu nbr != None).
-      - Điểm OOD tổng hợp trên thang nén log (-log / Q98):
-            s_ood = w_lat * s_lat + norm_ood_weight * s_norm + crec_ood_weight * s_crec
-        với mặc định (0.45 s_lat + 0.35 s_norm + 0.20 s_crec).
-      - Làm mịn điểm OOD theo tọa độ không gian (tự động bỏ qua khi nbr=None như MNIST).
-      - Tách ngưỡng tự thích ứng không rò rỉ bằng BIC + Ashman's D + 2-GMM(full) ML boundary.
+    Hàm suy luận & phát hiện OOD thống nhất, thuần đặc trưng (coordinate-free):
+    - Gán nhãn cụm Known bằng Spherical GMM với tiên nghiệm đều (uniform prior).
+    - Điểm OOD tổng hợp trên thang nén log (-log / Q98):
+          s_ood = w_lat * s_lat + norm_ood_weight * s_norm + crec_ood_weight * s_crec
+      với mặc định (0.45 s_lat + 0.35 s_norm + 0.20 s_crec).
+    - Tách ngưỡng tự thích ứng không rò rỉ bằng BIC + Ashman's D + 2-GMM ML boundary.
     """
     model.to(device)
     model.eval()
 
-    loader = DataLoader(dataset_spa, batch_size=batch_size, shuffle=False, drop_last=False)
+    loader = DataLoader(dataset_tgt, batch_size=batch_size, shuffle=False, drop_last=False)
     xs, mus = [], []
     for x, _, _ in loader:
         x = x.to(device)
@@ -1482,10 +1487,9 @@ def predict_spatial(model, dataset_spa, device, nbr=None, prior_mode="spatial",
     X_all = torch.cat(xs, dim=0)
     mu_all = torch.cat(mus, dim=0)
 
-    # 1. Gán nhãn cụm Known bằng Spherical GMM (+ spatial prior nếu có nbr)
-    effective_mode = prior_mode if nbr is not None else "uniform"
-    prior = compute_prior(model, mu_all, mode=effective_mode, nbr=nbr, alpha=alpha)
-    gamma = model.get_spherical_gamma(mu_all, pi=prior, use_emp_mu=True)
+    # 1. Gán nhãn cụm Known bằng Spherical GMM (luôn dùng tiên nghiệm đều)
+    uniform_prior = torch.full((model.n_clusters,), 1.0 / model.n_clusters, device=mu_all.device)
+    gamma = model.get_spherical_gamma(mu_all, pi=uniform_prior, use_emp_mu=True)
     H = -(gamma * torch.log(gamma + 1e-10)).sum(dim=1) / math.log(model.n_clusters)
     cluster = gamma.argmax(dim=1)
 
@@ -1506,12 +1510,7 @@ def predict_spatial(model, dataset_spa, device, nbr=None, prior_mode="spatial",
     lat_w = max(0.0, 1.0 - float(norm_ood_weight) - float(crec_ood_weight))
     ood_score = lat_w * s_lat + float(norm_ood_weight) * s_norm + float(crec_ood_weight) * s_crec
 
-    # 3. Làm mịn điểm OOD theo tọa độ không gian (tự động bỏ qua khi nbr=None)
-    if nbr is not None and effective_mode == "spatial" and spatial_ood_alpha > 0.0:
-        nbr_dev = nbr.to(device)
-        ood_score = (1.0 - spatial_ood_alpha) * ood_score + spatial_ood_alpha * ood_score[nbr_dev].mean(dim=1)
-
-    # 4. Xác định ngưỡng OOD tự thích ứng không rò rỉ
+    # 3. Xác định ngưỡng OOD tự thích ứng không rò rỉ
     ood_np = ood_score.cpu().numpy()
     if use_adaptive_thr:
         ood_thr, thr_mode, ashman_d = _adaptive_ood_threshold(
@@ -1543,3 +1542,5 @@ def predict_spatial(model, dataset_spa, device, nbr=None, prior_mode="spatial",
         "ood_thr": ood_thr,
         "accept": accept,
     }
+
+predict_spatial = predict_target
